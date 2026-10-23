@@ -10,6 +10,8 @@ function sanitize(names: string[], prefix: string): string[] {
   return names.map((n, i) => {
     let s = n.replace(/\]\[/g, '_').replace(/[^A-Za-z0-9_.]/g, (c) => (c === ']' ? '' : '_')) || `${prefix}${i + 1}`;
     if (/^[0-9.eE]/.test(s)) s = `${prefix}${s}`;
+    // Section keywords of the LP format cannot be names.
+    if (/^(max|min|maximize|minimize|maximum|minimum|st|subject|such|bounds?|generals?|gen|binary|binaries|bin|semi|semis|end|free|inf|infinity)$/i.test(s)) s = `${s}_`;
     let u = s;
     for (let k = 2; seen.has(u); k++) u = `${s}_${k}`;
     seen.add(u);

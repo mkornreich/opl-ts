@@ -8,12 +8,18 @@ export class DVar {
   /** Solution value, reduced cost (NaN until solved). */
   value = NaN;
   rc = NaN;
+  /** For `var Enum x`: values are the enum's ordinals. */
+  enumType?: import('./values.js').EnumType;
+  /** For `var int x in S`: the allowed values. */
+  domain?: number[];
+  /** Introduced by flattening, not declared by the model. */
+  aux = false;
   constructor(
     readonly id: number,
     readonly name: string,
     readonly isInt: boolean,
-    readonly lb: number,
-    readonly ub: number,
+    public lb: number,
+    public ub: number,
   ) {}
 }
 

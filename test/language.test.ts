@@ -146,10 +146,19 @@ describe('models', () => {
     assert.equal(solve('var float+ x, y;\nmaximize x + y subject to { x - y <= 1; };').info?.status, 'unbounded');
   });
 
-  it('rejects non-linear constraints and unindexed labels in forall', () => {
-    throwsAt(() => solve('var float x[1..2];\nminimize x[1]\nsubject to {\n  x[1] * x[2] <= 4;\n};'), /non-linear/, 4);
-    throwsAt(() => solve('var float x[1..2];\nminimize x[1] subject to {\n forall(i in 1..2) c: x[i] >= 0;\n};'), /must be indexed/, 3);
-    throwsAt(() => solve('var float x;\nminimize x subject to x < 3;'), /not allowed in a linear constraint/, 2);
+  it('indexes labels inside forall by the iterators (modern OPL)', () => {
+    const { lines } = solve('dvar float x[1..2];\nminimize x[1] + x[2] subject to {\n forall(i in 1..2) c: x[i] >= i;\n};\ndisplay(i in 1..2) c[i].dual;');
+    assert.deepEqual(lines, ['c[1].dual = 1.0000', 'c[2].dual = 1.0000']);
+  });
+
+  it('rejects decision variables in conditions', () => {
+    throwsAt(() => solve('var int x in 0..3;\nminimize x subject to {\n forall(i in 1..2 : x > i) x >= i;\n};'), /cannot appear in a condition/, 3);
+  });
+
+  it('sends non-linear models to constraint programming', () => {
+    const { info } = solve('var int x[1..2] in 0..5;\nmaximize x[1] + x[2]\nsubject to {\n  x[1] * x[2] <= 4;\n  x[1] < x[2];\n};');
+    assert.equal(info?.solver, 'CP');
+    assert.equal(info?.objective, 5);
   });
 });
 

@@ -21,10 +21,14 @@ export type Expr =
   | { k: 'setLit'; items: Expr[]; pos: SourcePos }
   | { k: 'setComp'; head: Expr; q: Quantifier; pos: SourcePos }
   | { k: 'arrayLit'; items: Expr[]; pos: SourcePos }
+  /** [key : value | quantifier] or [value | quantifier] (generic array initialisation) */
+  | { k: 'arrayComp'; key: Expr | null; value: Expr; q: Quantifier; pos: SourcePos }
   | { k: 'indexedLit'; entries: { key: Expr; value: Expr }[]; pos: SourcePos }
   | { k: 'tuple'; items: Expr[]; pos: SourcePos }
   | { k: 'namedTuple'; fields: { name: string; value: Expr }[]; pos: SourcePos }
-  | { k: 'cond'; c: Expr; a: Expr; b: Expr; pos: SourcePos };
+  | { k: 'cond'; c: Expr; a: Expr; b: Expr; pos: SourcePos }
+  /** piecewise[(q)]{ slope -> breakpoint; ...; lastSlope } [(x0, y0)] [operand] */
+  | { k: 'piecewise'; q: Quantifier | null; items: { slope: Expr; bp: Expr }[]; last: Expr; origin: [Expr, Expr] | null; operand: Expr | null; pos: SourcePos };
 
 export interface Binder {
   /** Iterator names; for a tuple pattern <a,b> in S these are the components. */
@@ -32,11 +36,17 @@ export interface Binder {
   pattern: boolean;
   domain: Expr;
   filter?: Expr;
+  /** `ordered i, j in S`: the iterators take strictly increasing positions of S. */
+  ordered?: boolean;
+  /** Tuple pattern components that are expressions (`<n, s.dept> in S`): matched, not bound. */
+  patternExprs?: (Expr | null)[];
   pos: SourcePos;
 }
 
 export interface Quantifier {
   binders: Binder[];
+  /** `ordered by increasing|decreasing expr` */
+  order?: { dir: 1 | -1; key: Expr };
   pos: SourcePos;
 }
 
@@ -60,7 +70,8 @@ export type DataInit =
   | { k: 'external' }
   | { k: 'sheet'; conn: string; range: Expr }
   | { k: 'file'; path: string }
-  | { k: 'prompt'; text: string };
+  | { k: 'prompt'; text: string }
+  | { k: 'db'; conn: string; sql: Expr };
 
 // ---------------------------------------------------------------- statements
 
@@ -68,6 +79,8 @@ export interface FieldDecl {
   type: TypeExpr;
   name: string;
   dims: Dim[];
+  /** A key field: tuples can be referred to by their key values. */
+  key?: boolean;
   pos: SourcePos;
 }
 
@@ -76,17 +89,52 @@ export type Stmt =
   | { k: 'enum'; name: string; values: string[] | null; pos: SourcePos }
   | { k: 'struct'; name: string; fields: FieldDecl[]; pos: SourcePos }
   | { k: 'data'; type: TypeExpr; name: string; dims: Dim[]; init: DataInit | null; pos: SourcePos }
-  | { k: 'var'; type: TypeExpr; name: string; dims: Dim[]; domain: Expr | null; pos: SourcePos }
+  /** modern: declared with `dvar` (non-negative by default) rather than OPL 3 `var`. */
+  | { k: 'var'; type: TypeExpr; name: string; dims: Dim[]; domain: Expr | null; modern?: boolean; interval?: IntervalSpec; alias?: Expr; pos: SourcePos }
+  /** dexpr T name[dims] = expr; (a named expression over decision variables) */
+  | { k: 'dexpr'; type: TypeExpr; name: string; dims: Dim[]; e: Expr; pos: SourcePos }
+  | { k: 'script'; kind: 'execute' | 'main'; name: string | null; code: string; pos: SourcePos }
+  | { k: 'using'; solver: string; pos: SourcePos }
+  | { k: 'assert'; label: string | null; q: Quantifier | null; e: Expr; pos: SourcePos }
+  | { k: 'include'; file: string; pos: SourcePos }
+  | { k: 'predicate'; name: string; arity: number; set: Expr; pos: SourcePos }
   | { k: 'constraintDecl'; name: string; dims: Dim[]; pos: SourcePos }
   | { k: 'objective'; sense: 'minimize' | 'maximize' | null; e: Expr | null; constraints: CStmt[]; pos: SourcePos }
   | { k: 'display'; q: Quantifier | null; e: Expr; pos: SourcePos }
   | { k: 'sheetConnection'; name: string; args: Expr[]; pos: SourcePos }
-  | { k: 'sheetWrite'; conn: string; range: Expr; e: Expr; pos: SourcePos };
+  | { k: 'sheetWrite'; conn: string; range: Expr; e: Expr; pos: SourcePos }
+  | { k: 'dbConnection'; name: string; args: Expr[]; pos: SourcePos }
+  | { k: 'dbUpdate'; conn: string; sql: Expr; e: Expr | null; pos: SourcePos }
+  | { k: 'search'; body: SStmt[]; pos: SourcePos }
+  | { k: 'horizon'; which: 'horizon' | 'origin'; e: Expr; pos: SourcePos }
+  | { k: 'activity'; name: string; dims: Dim[]; duration: Expr | null; breakable: boolean; pos: SourcePos }
+  | { k: 'resource'; kind: ResourceDeclKind; name: string; dims: Dim[]; args: Expr[]; pos: SourcePos };
+
+/** dvar interval a [optional] [in lo..hi] [size s] */
+export interface IntervalSpec {
+  optional: boolean;
+  window: Expr | null;
+  size: Expr | null;
+}
+
+export type ResourceDeclKind = 'UnaryResource' | 'DiscreteResource' | 'Reservoir' | 'StateResource' | 'AlternativeResources';
 
 export type CStmt =
-  | { k: 'forall'; q: Quantifier; body: CStmt[]; pos: SourcePos }
+  /** label: a label written before the forall, applied to the constraints inside. */
+  | { k: 'forall'; q: Quantifier; body: CStmt[]; label?: Expr; pos: SourcePos }
   | { k: 'if'; c: Expr; then: CStmt[]; else: CStmt[]; pos: SourcePos }
-  | { k: 'constraint'; label: Expr | null; e: Expr; pos: SourcePos };
+  /** level: onValue / onDomain / onRange / onBounds propagation strength. */
+  | { k: 'constraint'; label: Expr | null; e: Expr; level?: string; pos: SourcePos };
+
+/** Statements of a search procedure. */
+export type SStmt =
+  | { k: 'forall' | 'tryall' | 'select'; q: Quantifier; body: SStmt[]; pos: SourcePos }
+  | { k: 'try'; alts: SStmt[][]; pos: SourcePos }
+  | { k: 'if'; c: Expr; then: SStmt[]; else: SStmt[]; pos: SourcePos }
+  | { k: 'while'; c: Expr; body: SStmt[]; pos: SourcePos }
+  | { k: 'strategy'; name: string; args: Expr[]; body: SStmt[]; pos: SourcePos }
+  /** A constraint to post, or a search built-in such as generate(x). */
+  | { k: 'post'; e: Expr; pos: SourcePos };
 
 export interface ModelAst {
   file: string;
@@ -95,7 +143,12 @@ export interface ModelAst {
 
 export interface DataAst {
   file: string;
+  /** name = value;  or  name from SheetRead(conn, "range"); (value is then a call) */
   entries: { name: string; value: Expr; pos: SourcePos }[];
+  /** SheetConnection / DBConnection declared in the data file. */
+  connections?: { kind: 'sheet' | 'db'; name: string; args: Expr[]; pos: SourcePos }[];
+  /** name to SheetWrite(conn, "range");  name to DBUpdate(conn, "sql"); */
+  writes?: { name: string; call: Expr; pos: SourcePos }[];
 }
 
 // ---------------------------------------------------------------- OPLScript
@@ -112,7 +165,12 @@ export type ScriptStmt =
   | { k: 'while'; c: Expr; body: ScriptStmt[]; pos: SourcePos }
   | { k: 'repeat'; body: ScriptStmt[]; c: Expr; pos: SourcePos }
   | { k: 'if'; c: Expr; then: ScriptStmt[]; else: ScriptStmt[]; pos: SourcePos }
-  | { k: 'display'; q: Quantifier | null; e: Expr; pos: SourcePos };
+  | { k: 'display'; q: Quantifier | null; e: Expr; pos: SourcePos }
+  /** import enum E m.E;  (the name is taken from a model) */
+  | { k: 'import'; kind: string; name: string; from: Expr; pos: SourcePos }
+  /** Other objects, e.g. `Basis b(m);` */
+  | { k: 'object'; type: string; name: string; args: Expr[]; pos: SourcePos }
+  | { k: 'enum'; name: string; values: string[]; pos: SourcePos };
 
 export interface ScriptAst {
   file: string;

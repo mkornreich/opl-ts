@@ -26,6 +26,10 @@ export interface RunOptions {
   input?: (prompt: string) => string | null;
   /** Also write the generated problem to this file in CPLEX LP format. */
   exportLp?: string;
+  /** Solve with constraint programming even when the model is linear. */
+  forceCP?: boolean;
+  /** Constraint programming without objective: print every solution. */
+  allSolutions?: boolean;
 }
 
 export interface RunResult {
@@ -65,11 +69,19 @@ export function runFile(file: string, dataFiles: string[], options: RunOptions =
 
   const model = loadModel(modelFile, data, {
     out: (line) => write(line + '\n'),
+    write,
     warn,
     input: options.input,
     nodeSelection,
     timeLimit: options.timeLimit,
+    forceCP: options.forceCP,
+    allSolutions: options.allSolutions,
   });
+  if (model.hasMain) {
+    // The main block drives generation, solving and output.
+    model.runMain();
+    return { kind: 'model', model, solve: model.lastSolve };
+  }
   model.initData();
   if (options.exportLp && model.hasObjective) fs.writeFileSync(options.exportLp, model.exportLP());
   if (!model.hasObjective) {
@@ -77,9 +89,20 @@ export function runFile(file: string, dataFiles: string[], options: RunOptions =
     return { kind: 'model', model, solve: null };
   }
   const info = model.solve();
-  write(statusLine(info) + '\n');
-  model.postProcess();
-  if (model.solved && (options.listVariables || !model.hasOutputStatements)) model.printVariables(hideZero);
+  const listVars = options.listVariables || !model.hasOutputStatements;
+  if (options.allSolutions && info.solver === 'CP' && !info.sense) {
+    write(`${info.solutions} solution${info.solutions === 1 ? '' : 's'} found\n`);
+    for (let k = 0; k < model.solutionCount; k++) {
+      model.loadSolution(k);
+      write(`Solution [${k + 1}]\n`);
+      model.postProcess();
+      if (listVars) model.printVariables(hideZero);
+    }
+  } else {
+    write(statusLine(info) + '\n');
+    model.postProcess();
+    if (model.solved && listVars) model.printVariables(hideZero);
+  }
   if (options.stats ?? true) write(statsLine(info) + '\n');
   return { kind: 'model', model, solve: info };
 }
@@ -103,6 +126,10 @@ export function statusLine(info: SolveInfo): string {
 }
 
 export function statsLine(info: SolveInfo): string {
+  if (info.solver === 'CP') {
+    return `[CP: ${info.numVars} variables, ${info.numConstraints} constraints; ` +
+      `${info.choicePoints} choice points, ${info.fails} fails; ${info.time.toFixed(3)} s]`;
+  }
   const kind = info.numIntVars > 0 ? 'MIP' : 'LP';
   const ints = info.numIntVars > 0 ? ` (${info.numIntVars} integer)` : '';
   const nodes = info.numIntVars > 0 ? `, ${info.nodes} branch-and-bound nodes` : '';

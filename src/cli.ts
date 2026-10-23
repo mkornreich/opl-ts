@@ -16,6 +16,8 @@ options:
       --node-sel N    branch-and-bound node selection: 0 = depth-first, 1 = best-bound
       --time-limit S  stop branch and bound after S seconds
       --export-lp F   also write the generated problem to F in CPLEX LP format
+      --cp            solve with constraint programming even if the model is linear
+      --all-solutions constraint programming without objective: print every solution
   -h, --help          show this help
 `;
 
@@ -70,6 +72,12 @@ function main(argv: string[]): number {
       case '--time-limit':
         options.timeLimit = value();
         break;
+      case '--cp':
+        options.forceCP = true;
+        break;
+      case '--all-solutions':
+        options.allSolutions = true;
+        break;
       case '--export-lp':
         options.exportLp = argv[++i];
         if (!options.exportLp) throw new OplError(`${a} needs a file name`);
@@ -87,6 +95,12 @@ function main(argv: string[]): number {
   runFile(file, data, options);
   return 0;
 }
+
+// Exit quietly when the output is piped into a program that stops reading (e.g. head).
+process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+  if (e.code === 'EPIPE') process.exit(0);
+  throw e;
+});
 
 try {
   process.exitCode = main(process.argv.slice(2));

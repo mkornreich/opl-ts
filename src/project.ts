@@ -8,6 +8,8 @@ import * as path from 'node:path';
 import type { Warn } from './files.js';
 import { resolveInput } from './files.js';
 import { ModelInstance, type ModelOptions } from './model.js';
+import type { ModelAst } from './ast.js';
+import { OplError } from './errors.js';
 import { parseData, parseModel } from './parser.js';
 
 export interface Project {
@@ -36,9 +38,24 @@ export function readProject(file: string, warn: Warn): Project {
   return { file, model, data, settings };
 }
 
+/** Parses a model, splicing in `include "file";` statements. */
+export function parseModelFile(file: string, seen = new Set<string>()): ModelAst {
+  const full = path.resolve(file);
+  if (seen.has(full)) throw new OplError(`${file} includes itself`);
+  seen.add(full);
+  const ast = parseModel(fs.readFileSync(full, 'utf8'), file);
+  const stmts = ast.stmts.flatMap((st) => {
+    if (st.k !== 'include') return [st];
+    const inc = resolveInput(st.file, path.dirname(full), () => {}, st.pos);
+    return parseModelFile(inc, seen).stmts;
+  });
+  seen.delete(full);
+  return { file, stmts };
+}
+
 /** Parses a model and its data files into a ModelInstance. */
 export function loadModel(modelFile: string, dataFiles: string[], options: Omit<ModelOptions, 'baseDir'> & { baseDir?: string }): ModelInstance {
-  const ast = parseModel(fs.readFileSync(modelFile, 'utf8'), modelFile);
+  const ast = parseModelFile(modelFile);
   const data = dataFiles.map((f) => parseData(fs.readFileSync(f, 'utf8'), f));
   return new ModelInstance(ast, data, { ...options, baseDir: options.baseDir ?? path.dirname(path.resolve(modelFile)) });
 }

@@ -4,7 +4,8 @@
 
 import { fail, type SourcePos } from './errors.js';
 
-export type TokenKind = 'ident' | 'int' | 'float' | 'string' | 'punct' | 'eof';
+/** 'script': the raw body of an `execute { ... }` or `main { ... }` block (IBM ILOG Script). */
+export type TokenKind = 'ident' | 'int' | 'float' | 'string' | 'punct' | 'script' | 'eof';
 
 export interface Token {
   kind: TokenKind;
@@ -16,8 +17,8 @@ export interface Token {
 
 // Longest first.
 const PUNCTUATION = [
-  '...', '#[', ']#', '#<', '>#', '..', ':=', '<=', '>=', '==', '!=', '<>', '<<',
-  '&&', '||', '\\/', '/\\', '=>',
+  '...', '<=>', '#[', ']#', '#<', '>#', '..', ':=', '<=', '>=', '==', '!=', '<>', '<<',
+  '&&', '||', '\\/', '/\\', '=>', '->',
   '+', '-', '*', '/', '%', '^', '(', ')', '[', ']', '{', '}', '<', '>', '=', ',', ';',
   ':', '.', '|', '&', '!', '?',
 ];
@@ -63,7 +64,28 @@ export function tokenize(src: string, file: string): Token[] {
     const start = i;
     if (isIdentStart(c)) {
       while (i < src.length && isIdentPart(src[i])) i++;
-      tokens.push({ kind: 'ident', text: src.slice(start, i), pos: pos(start) });
+      const word = src.slice(start, i);
+      tokens.push({ kind: 'ident', text: word, pos: pos(start) });
+      // execute [name] { script } and main { script }: keep the script text as one token.
+      if (word === 'execute' || word === 'main' || word === 'prepare') {
+        const m = /^\s*([A-Za-z_]\w*)?\s*\{/.exec(src.slice(i));
+        if (m && (word === 'execute' || !m[1])) {
+          if (m[1]) tokens.push({ kind: 'ident', text: m[1], pos: pos(i + m[0].indexOf(m[1])) });
+          const open = i + m[0].length - 1;
+          const close = matchingBrace(src, open);
+          if (close < 0) fail(`unterminated ${word} block`, pos(start));
+          const body = src.slice(open + 1, close);
+          const p = pos(open + 1);
+          tokens.push({ kind: 'script', text: body, value: body, pos: p });
+          for (let k = i; k <= close; k++) {
+            if (src[k] === '\n') {
+              line++;
+              lineStart = k + 1;
+            }
+          }
+          i = close + 1;
+        }
+      }
       continue;
     }
 
@@ -115,6 +137,25 @@ export function tokenize(src: string, file: string): Token[] {
   }
   tokens.push({ kind: 'eof', text: '<end of file>', pos: pos(i) });
   return tokens;
+}
+
+/** Index of the } matching the { at `open` (skipping JavaScript strings and comments), or -1. */
+function matchingBrace(src: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === '`') {
+      for (i++; i < src.length && src[i] !== c; i++) if (src[i] === '\\') i++;
+    } else if (c === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+    } else if (c === '/' && src[i + 1] === '*') {
+      i = src.indexOf('*/', i + 2);
+      if (i < 0) return -1;
+      i++;
+    } else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) return i;
+  }
+  return -1;
 }
 
 function isDigit(c: string): boolean {

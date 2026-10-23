@@ -49,6 +49,8 @@ export function printExpr(e: Expr, subst: (name: string) => string | null = () =
         return `{${x.items.map((a) => p(a)).join(', ')}}`;
       case 'setComp':
         return `{${p(x.head)} | ${printQuantifier(x.q, p)}}`;
+      case 'arrayComp':
+        return `[${x.key ? `${p(x.key)} : ` : ''}${p(x.value)} | ${printQuantifier(x.q, p)}]`;
       case 'arrayLit':
         return `[${x.items.map((a) => p(a)).join(', ')}]`;
       case 'indexedLit':
@@ -59,6 +61,8 @@ export function printExpr(e: Expr, subst: (name: string) => string | null = () =
         return `#<${x.fields.map((f) => `${f.name}: ${p(f.value)}`).join(', ')}>#`;
       case 'cond':
         return wrap(`${p(x.c, 1)} ? ${p(x.a)} : ${p(x.b)}`, 0, ctx);
+      case 'piecewise':
+        return `piecewise{${x.items.map((it) => `${p(it.slope)} -> ${p(it.bp)}; `).join('')}${p(x.last)}}${x.operand ? ` ${p(x.operand, 8)}` : ''}`;
     }
   };
   return p(e);

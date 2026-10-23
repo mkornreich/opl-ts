@@ -13,7 +13,7 @@ import type { ModelInstance } from './model.js';
 import { printExpr } from './print.js';
 import { loadModel, readProject } from './project.js';
 import {
-  FLOAT, formatValue, INT, indexType, OplArray, OplRange, UNKNOWN,
+  EnumType, FLOAT, formatValue, INT, indexType, OplArray, OplRange, UNKNOWN,
   type Binding, type HostObject, type Type, type Value,
 } from './values.js';
 
@@ -28,6 +28,8 @@ export interface ScriptOptions {
 
 class ScriptModel implements HostObject {
   readonly hostKind = 'Model';
+  /** nextSolution(): index of the current solution among all solutions. */
+  private cursor = -1;
   constructor(
     readonly name: string,
     readonly instance: ModelInstance,
@@ -47,10 +49,28 @@ class ScriptModel implements HostObject {
       case 'solve': {
         noArgs();
         inst.reset();
+        inst.options.allSolutions = false;
         inst.solve();
         inst.postProcess();
+        this.cursor = inst.solved ? 0 : -1;
         return { value: inst.solved ? 1 : 0, type: INT };
       }
+      case 'nextSolution': {
+        noArgs();
+        if (this.cursor < 0) fail(`${this.name}.nextSolution(): call solve() first`);
+        if (inst.solutionCount <= 1 && inst.lastSolve && !inst.lastSolve.sense) {
+          inst.options.allSolutions = true;
+          inst.solve();
+        }
+        if (this.cursor + 1 >= inst.solutionCount) return { value: 0, type: INT };
+        inst.loadSolution(++this.cursor);
+        inst.postProcess();
+        return { value: 1, type: INT };
+      }
+      case 'setBasis':
+      case 'setMipStart':
+        // Warm starts do not change results; the solver always starts from scratch.
+        return { value: 0, type: INT };
       case 'objectiveValue':
       case 'getObjValue':
         noArgs();
@@ -69,7 +89,10 @@ class ScriptModel implements HostObject {
       case 'restore':
         noArgs();
         inst.reset();
+        this.cursor = -1;
         return { value: 0, type: INT };
+      case 'getNumberOfSolutions':
+        return { value: inst.solutionCount, type: INT };
     }
     fail(`Model has no method '${name}'`);
   }
@@ -215,6 +238,27 @@ export class ScriptRunner {
         return;
       case 'if':
         this.block(ev.truthy(st.c, s) ? st.then : st.else, new Scope(s));
+        return;
+      case 'import': {
+        const v = ev.evalRef(st.from, s);
+        if (st.kind === 'enum') {
+          if (!(v instanceof EnumType)) fail(`${printExpr(st.from)} is not an enum`, st.pos);
+          s.define(st.name, { value: v, type: { k: 'enumType', e: v } });
+          for (const x of v.values) s.define(x, { value: x, type: { k: 'enum', e: v } });
+        } else {
+          s.define(st.name, { value: v, type: ev.typeOf(st.from, s) });
+        }
+        return;
+      }
+      case 'enum': {
+        const e = new EnumType(st.name, st.values);
+        s.define(st.name, { value: e, type: { k: 'enumType', e } });
+        for (const x of st.values) s.define(x, { value: x, type: { k: 'enum', e } });
+        return;
+      }
+      case 'object':
+        // Basis, Solution, MipStart: warm-start information, kept as an opaque object.
+        s.define(st.name, { value: { hostKind: st.type }, type: { k: 'host' } });
         return;
       case 'display': {
         const emit = (sc: Scope) => {

@@ -6,6 +6,7 @@
  * Enum values and strings are JS strings.
  */
 
+import { Activity, CPConstraint, Resource } from './cp/terms.js';
 import { ConstraintRef, DVar, LinExpr } from './linear.js';
 
 // ---------------------------------------------------------------- collections
@@ -70,6 +71,10 @@ export class OplSet implements IndexSet {
   get size(): number {
     return this.elems.length;
   }
+  clear(): void {
+    this.elems.length = 0;
+    this.keys.clear();
+  }
   indexOf(v: Value): number {
     return this.keys.get(keyOf(v)) ?? -1;
   }
@@ -81,15 +86,29 @@ export class OplSet implements IndexSet {
 export interface StructField {
   name: string;
   type: Type;
+  key?: boolean;
 }
 
 export class StructType {
   readonly index = new Map<string, number>();
+  /** Positions of the key fields (modern OPL `key`). */
+  readonly keyFields: number[];
+  /** Tuples of this type seen in sets, by key: data may refer to a tuple by its key. */
+  readonly byKey = new Map<string, OplTuple>();
   constructor(
     readonly name: string,
     readonly fields: StructField[],
   ) {
     fields.forEach((f, i) => this.index.set(f.name, i));
+    this.keyFields = fields.flatMap((f, i) => (f.key ? [i] : []));
+  }
+
+  keyOfValues(values: Value[]): string {
+    return this.keyFields.length === 1 ? keyOf(values[0]) : keyOf(new OplTuple(null, values));
+  }
+
+  register(t: OplTuple): void {
+    if (this.keyFields.length) this.byKey.set(this.keyOfValues(this.keyFields.map((i) => t.values[i])), t);
   }
 }
 
@@ -144,6 +163,14 @@ export type Value =
   | DVar
   | LinExpr
   | ConstraintRef
+  | CPConstraint
+  | Activity
+  | Resource
+  | import('./eval.js').DExpr
+  | import('./eval.js').VarIndexed
+  | import('./eval.js').Predicate
+  | import('./eval.js').PwlFunction
+  | import('./eval.js').CumulExpr
   | HostObject;
 
 // ---------------------------------------------------------------- types
@@ -167,6 +194,8 @@ export type Type =
 export interface Binding {
   value: Value;
   type: Type;
+  /** Bound by a quantifier or a generic array index (not a declaration). */
+  iterator?: boolean;
 }
 
 export const INT: Type = { k: 'int' };
@@ -237,7 +266,10 @@ export function typeName(v: Value): string {
   if (v instanceof DVar) return 'decision variable';
   if (v instanceof LinExpr) return 'linear expression';
   if (v instanceof ConstraintRef) return 'constraint';
-  return v.hostKind;
+  if (v instanceof CPConstraint) return 'constraint';
+  if (v instanceof Activity) return 'activity';
+  if (v instanceof Resource) return 'resource';
+  return 'hostKind' in v ? v.hostKind : 'dexpr';
 }
 
 /** Elements of a set-like value, or null when v cannot be iterated. */
@@ -277,7 +309,16 @@ export function formatNumber(v: number, isInt: boolean, style: FormatStyle): str
 }
 
 export function formatValue(v: Value, t: Type, style: FormatStyle): string {
-  if (v instanceof DVar) return formatNumber(v.value, v.isInt, style);
+  if (v instanceof DVar) {
+    if (v.enumType && !Number.isNaN(v.value)) return v.enumType.values[v.value];
+    return formatNumber(v.value, v.isInt, style);
+  }
+  if (v instanceof Activity) {
+    const n = (x: DVar | number) => formatNumber(typeof x === 'number' ? x : x.value, true, style);
+    return `[${n(v.start)} -- ${n(v.duration)} --> ${n(v.end)}]`;
+  }
+  if (v instanceof Resource) return v.name;
+  if (v instanceof CPConstraint) return 'constraint';
   if (typeof v === 'number') {
     const isInt = t.k === 'unknown' ? Number.isInteger(v) : isIntType(t);
     return formatNumber(v, isInt, style);
@@ -308,7 +349,7 @@ export function formatValue(v: Value, t: Type, style: FormatStyle): string {
   }
   if (v instanceof LinExpr) return formatLinExpr(v);
   if (v instanceof ConstraintRef) return v.name;
-  return `<${v.hostKind}>`;
+  return 'hostKind' in v ? `<${v.hostKind}>` : 'dexpr';
 }
 
 function formatLinExpr(e: LinExpr): string {

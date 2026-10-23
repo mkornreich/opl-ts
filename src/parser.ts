@@ -3,14 +3,21 @@
  */
 
 import type {
-  Binder, CStmt, DataAst, DataInit, Dim, Expr, FieldDecl, ModelAst, Quantifier,
-  ScriptAst, ScriptStmt, Stmt, TypeExpr,
+  Binder, CStmt, DataAst, DataInit, Dim, Expr, FieldDecl, ModelAst, Quantifier, ResourceDeclKind,
+  ScriptAst, ScriptStmt, SStmt, Stmt, TypeExpr,
 } from './ast.js';
 import { fail, type SourcePos } from './errors.js';
 import { tokenize, type Token } from './lexer.js';
 
 const COMPARISON = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
-const AGGREGATES = new Set(['sum', 'prod', 'min', 'max', 'or', 'and']);
+const AGGREGATES = new Set(['sum', 'prod', 'min', 'max', 'or', 'and', 'all', 'union', 'inter']);
+/** Binary scheduling constraints written infix: `a precedes b;`, `a requires(2) r;`. */
+const INFIX_CONSTRAINTS = new Set(['precedes', 'requires', 'consumes', 'produces']);
+const FILTER_LEVELS = new Set(['onValue', 'onDomain', 'onRange', 'onBounds']);
+const RESOURCE_KINDS = new Set(['UnaryResource', 'DiscreteResource', 'Reservoir', 'StateResource', 'AlternativeResources']);
+/** `sorted {int}`, `ordered {string}`, `reversed {int}`: ordering qualifiers of set types. */
+const SET_QUALIFIERS = new Set(['sorted', 'ordered', 'reversed']);
+const STRATEGIES = new Set(['LDSearch', 'DFSearch', 'BFSearch', 'IDFSearch', 'SBSearch', 'DDSearch']);
 
 class Parser {
   private i = 0;
@@ -72,7 +79,7 @@ class Parser {
   // ------------------------------------------------------------ expressions
 
   parseExpr(): Expr {
-    const c = this.parseOr();
+    const c = this.parseImplies();
     if (this.isPunct('?')) {
       const pos = this.next().pos;
       const a = this.parseExpr();
@@ -81,6 +88,16 @@ class Parser {
       return { k: 'cond', c, a, b, pos };
     }
     return c;
+  }
+
+  /** a => b, a <=> b (lowest-precedence logical operators, right-associative). */
+  private parseImplies(): Expr {
+    const l = this.parseOr();
+    if (this.isPunct('=>') || this.isPunct('<=>')) {
+      const t = this.next();
+      return { k: 'bin', op: t.text, l, r: this.parseImplies(), pos: t.pos };
+    }
+    return l;
   }
 
   private parseOr(): Expr {
@@ -140,7 +157,7 @@ class Parser {
     return lo;
   }
 
-  private parseAdd(): Expr {
+  parseAdd(): Expr {
     let l = this.parseMul();
     for (;;) {
       let op: string | null = null;
@@ -164,7 +181,7 @@ class Parser {
     }
   }
 
-  private parseUnary(): Expr {
+  parseUnary(): Expr {
     if (this.isPunct('-') || this.isPunct('+')) {
       const t = this.next();
       const e = this.parseUnary();
@@ -183,7 +200,7 @@ class Parser {
     return base;
   }
 
-  private parsePostfix(): Expr {
+  parsePostfix(): Expr {
     let e = this.parsePrimary();
     for (;;) {
       if (this.isPunct('[')) {
@@ -230,12 +247,16 @@ class Parser {
       return { k: 'str', value: t.value as string, pos };
     }
     if (t.kind === 'ident') {
+      if (t.text === 'piecewise' && (this.isPunct('{', 1) || this.isPunct('(', 1))) return this.parsePiecewise();
       if (AGGREGATES.has(t.text) && this.isPunct('(', 1) &&
           (t.text === 'sum' || t.text === 'prod' || this.binderFollows(2))) {
         this.next();
         this.next();
         const q = this.parseQuantifier(')');
-        const body = this.parseMul();
+        // all(...) builds an array argument: its body extends to the closing parenthesis.
+        // all(...) builds an array argument: its body extends to the closing parenthesis;
+        // or(...) / and(...) take a condition.
+        const body = t.text === 'all' ? this.parseExpr() : t.text === 'or' || t.text === 'and' ? this.parseNot() : this.parseMul();
         return { k: 'agg', op: t.text, q, body, pos };
       }
       this.next();
@@ -262,7 +283,22 @@ class Parser {
       return { k: 'setLit', items, pos };
     }
     if (this.acceptPunct('[')) {
-      const items: Expr[] = [];
+      if (this.acceptPunct(']')) return { k: 'arrayLit', items: [], pos };
+      const first = this.parseExpr();
+      // [key : value | quantifier] and [value | quantifier]
+      if (this.isPunct(':') || this.isPunct('|')) {
+        let key: Expr | null = null;
+        let value = first;
+        if (this.acceptPunct(':')) {
+          key = first;
+          value = this.parseExpr();
+          // [key : value] (no quantifier): one entry, as in [i : [t : v] | <i,t,v> in S]
+          if (this.acceptPunct(']')) return { k: 'indexedLit', entries: [{ key, value }], pos };
+        }
+        this.expectPunct('|');
+        return { k: 'arrayComp', key, value, q: this.parseQuantifier(']'), pos };
+      }
+      const items: Expr[] = [first];
       this.parseItems(items, ']', () => this.parseExpr());
       return { k: 'arrayLit', items, pos };
     }
@@ -278,6 +314,40 @@ class Parser {
       return { k: 'namedTuple', fields: this.parseNamedFields(() => this.parseRange()), pos };
     }
     this.unexpected('an expression');
+  }
+
+  /** piecewise[(q)]{ slope -> breakpoint; ...; lastSlope } [(x0, y0)] [operand] */
+  private parsePiecewise(): Expr {
+    const pos = this.next().pos;
+    const q = this.acceptPunct('(') ? this.parseQuantifier(')') : null;
+    this.expectPunct('{');
+    const items: { slope: Expr; bp: Expr }[] = [];
+    let last: Expr;
+    for (;;) {
+      const e = this.parseExpr();
+      if (this.acceptPunct('->')) {
+        items.push({ slope: e, bp: this.parseExpr() });
+        this.expectPunct(';');
+        continue;
+      }
+      last = e;
+      this.acceptPunct(';');
+      this.expectPunct('}');
+      break;
+    }
+    let origin: [Expr, Expr] | null = null;
+    let operand: Expr | null = null;
+    if (this.acceptPunct('(')) {
+      const args = this.parseArgs(')');
+      if (args.length === 2) origin = [args[0], args[1]];
+      else if (args.length === 1) operand = args[0];
+      else this.unexpected('(x0, y0) or an operand');
+    }
+    const t = this.peek();
+    if (!operand && (t.kind === 'ident' || t.kind === 'int' || t.kind === 'float' || this.isPunct('(') || this.isPunct('-'))) {
+      operand = this.parseUnary();
+    }
+    return { k: 'piecewise', q, items, last, origin, operand, pos };
   }
 
   /** Items separated by optional commas, up to the closing token. */
@@ -316,6 +386,7 @@ class Parser {
 
   /** True when the tokens at offset k start a binder: `i in`, `i, j in` or `<`. */
   private binderFollows(k: number): boolean {
+    if (this.isIdent('ordered', k) && !this.isIdent('by', k + 1)) k++;
     if (this.isPunct('<', k)) return true;
     let j = k;
     for (;;) {
@@ -335,11 +406,22 @@ class Parser {
       const bpos = this.pos;
       const names: string[] = [];
       let pattern = false;
+      const ordered = this.isIdent('ordered') && !this.isIdent('by', 1) && this.isIdent(undefined, 1) ? (this.next(), true) : false;
+      let patternExprs: (Expr | null)[] | undefined;
       if (this.acceptPunct('<')) {
         pattern = true;
-        names.push(this.expectIdent().text);
-        while (this.acceptPunct(',')) names.push(this.expectIdent().text);
+        const exprs: (Expr | null)[] = [];
+        do {
+          if (this.isIdent() && (this.isPunct(',', 1) || this.isPunct('>', 1))) {
+            names.push(this.next().text);
+            exprs.push(null);
+          } else {
+            names.push(`$pattern${names.length}`);
+            exprs.push(this.parseAdd());
+          }
+        } while (this.acceptPunct(','));
         this.expectPunct('>');
+        if (exprs.some((x) => x)) patternExprs = exprs;
       } else {
         names.push(this.expectIdent().text);
         while (this.acceptPunct(',')) names.push(this.expectIdent().text);
@@ -347,11 +429,21 @@ class Parser {
       this.expectIdent('in');
       const domain = this.parseRange();
       const binder: Binder = { names, pattern, domain, pos: bpos };
+      if (patternExprs) binder.patternExprs = patternExprs;
+      if (ordered) binder.ordered = true;
       if (this.acceptPunct(':')) binder.filter = this.parseExpr();
       binders.push(binder);
       if (this.acceptPunct(',')) continue;
+      const q: Quantifier = { binders, pos };
+      if (this.isIdent('ordered') && this.isIdent('by', 1)) {
+        this.next();
+        this.next();
+        const dir = this.expectIdent().text;
+        if (dir !== 'increasing' && dir !== 'decreasing') fail("expected 'increasing' or 'decreasing'", this.pos);
+        q.order = { dir: dir === 'increasing' ? 1 : -1, key: this.parseExpr() };
+      }
       this.expectPunct(close);
-      return { binders, pos };
+      return q;
     }
   }
 
@@ -361,12 +453,14 @@ class Parser {
     const t = this.peek();
     if (t.kind === 'punct') return t.text === '{';
     if (t.kind !== 'ident') return false;
-    if (['int', 'float', 'string', 'setof'].includes(t.text)) return true;
+    if (['int', 'float', 'string', 'setof', 'boolean'].includes(t.text)) return true;
+    if (SET_QUALIFIERS.has(t.text) && this.isPunct('{', 1)) return true;
     // `Name name` is a declaration with a user-defined type.
     return this.peek(1).kind === 'ident' && !['in', 'to', 'not'].includes(this.peek(1).text);
   }
 
   parseType(): TypeExpr {
+    if (this.isIdent() && SET_QUALIFIERS.has(this.peek().text) && this.isPunct('{', 1)) this.next();
     const t = this.peek();
     if (this.acceptPunct('{')) {
       const of = this.parseType();
@@ -472,11 +566,12 @@ class Parser {
           const fields: FieldDecl[] = [];
           while (!this.acceptPunct('}')) {
             const fpos = this.pos;
+            const key = this.acceptIdent('key');
             const type = this.parseType();
             const fname = this.expectIdent().text;
             const dims = this.parseDims();
             this.expectPunct(';');
-            fields.push({ type, name: fname, dims, pos: fpos });
+            fields.push({ type, name: fname, dims, key, pos: fpos });
           }
           this.acceptPunct(';');
           return [{ k: 'struct', name, fields, pos }];
@@ -484,6 +579,8 @@ class Parser {
         case 'var':
         case 'dvar': {
           this.next();
+          const modern = t.text === 'dvar';
+          if (this.acceptIdent('interval')) return this.parseIntervalVars(modern);
           const type = this.parseType();
           const out: Stmt[] = [];
           do {
@@ -491,10 +588,88 @@ class Parser {
             const name = this.expectIdent().text;
             const dims = this.parseDims();
             const domain = this.acceptIdent('in') ? this.parseRange() : null;
-            out.push({ k: 'var', type, name, dims, domain, pos: vpos });
+            // dvar int x[1..3] = [a, b, c];  (an array of existing variables)
+            const alias = this.acceptPunct('=') ? this.parseExpr() : undefined;
+            out.push({ k: 'var', type, name, dims, domain, modern, alias, pos: vpos });
           } while (this.acceptPunct(','));
           this.expectPunct(';');
           return out;
+        }
+        case 'dexpr': {
+          this.next();
+          const type = this.parseType();
+          const name = this.expectIdent().text;
+          const dims = this.parseDims();
+          this.expectPunct('=');
+          const e = this.parseExpr();
+          this.expectPunct(';');
+          return [{ k: 'dexpr', type, name, dims, e, pos }];
+        }
+        case 'using': {
+          this.next();
+          const solver = this.expectIdent().text;
+          this.expectPunct(';');
+          return [{ k: 'using', solver, pos }];
+        }
+        case 'execute':
+        case 'main': {
+          this.next();
+          const name = t.text === 'execute' && this.peek().kind === 'ident' ? this.next().text : null;
+          const body = this.peek();
+          if (body.kind !== 'script') this.unexpected("'{'");
+          this.next();
+          this.acceptPunct(';');
+          return [{ k: 'script', kind: t.text, name, code: body.text, pos: body.pos }];
+        }
+        case 'assert': {
+          this.next();
+          let label: string | null = null;
+          if (this.isIdent() && this.isPunct(':', 1)) {
+            label = this.next().text;
+            this.next();
+          }
+          const binders: Binder[] = [];
+          while (this.isIdent('forall') && this.isPunct('(', 1)) {
+            this.next();
+            this.next();
+            binders.push(...this.parseQuantifier(')').binders);
+          }
+          const q: Quantifier | null = binders.length ? { binders, pos } : null;
+          if (q && !label && this.isIdent() && this.isPunct(':', 1)) {
+            label = this.next().text;
+            this.next();
+          }
+          const e = this.parseExpr();
+          this.expectPunct(';');
+          return [{ k: 'assert', label, q, e, pos }];
+        }
+        case 'predicate': {
+          // predicate p(int a, int b) in S;  ->  p(x, y) means <x, y> in S
+          this.next();
+          const name = this.expectIdent().text;
+          this.expectPunct('(');
+          let arity = 0;
+          while (!this.acceptPunct(')')) {
+            this.parseType();
+            this.expectIdent();
+            arity++;
+            this.acceptPunct(',');
+          }
+          this.expectIdent('in');
+          const set = this.parseExpr();
+          this.expectPunct(';');
+          return [{ k: 'predicate', name, arity, set, pos }];
+        }
+        case 'include': {
+          this.next();
+          const file = this.expectString();
+          this.acceptPunct(';');
+          return [{ k: 'include', file, pos }];
+        }
+        case 'constraints': {
+          if (!this.isPunct('{', 1)) break;
+          this.next();
+          return [{ k: 'objective', sense: null, e: null, constraints: this.parseCBlock(), pos }];
         }
         case 'constraint':
           if (this.isIdent(undefined, 1)) {
@@ -517,6 +692,9 @@ class Parser {
           if (this.acceptIdent('subject')) {
             this.expectIdent('to');
             constraints = this.parseCBlock();
+          } else if (this.isIdent('constraints') && this.isPunct('{', 1)) {
+            this.next();
+            constraints = this.parseCBlock();
           } else {
             this.acceptPunct(';');
           }
@@ -534,6 +712,69 @@ class Parser {
         case 'display':
           this.next();
           return this.parseDisplay(pos);
+        case 'search': {
+          this.next();
+          const body = this.parseSBlock();
+          return [{ k: 'search', body, pos }];
+        }
+        case 'scheduleHorizon':
+        case 'ScheduleHorizon':
+        case 'scheduleOrigin':
+        case 'ScheduleOrigin':
+          if (this.isPunct('=', 1)) {
+            this.next();
+            this.next();
+            const e = this.parseExpr();
+            this.expectPunct(';');
+            return [{ k: 'horizon', which: /horizon/i.test(t.text) ? 'horizon' : 'origin', e, pos }];
+          }
+          break;
+        case 'Activity': {
+          this.next();
+          const out: Stmt[] = [];
+          do {
+            const apos = this.pos;
+            const name = this.expectIdent().text;
+            const dims = this.parseDims();
+            let duration: Expr | null = null;
+            if (this.acceptPunct('(')) {
+              duration = this.parseExpr();
+              this.expectPunct(')');
+            }
+            const breakable = this.acceptIdent('breakable');
+            out.push({ k: 'activity', name, dims, duration, breakable, pos: apos });
+          } while (this.acceptPunct(','));
+          this.expectPunct(';');
+          return out;
+        }
+        case 'DBconnection':
+        case 'DBConnection': {
+          this.next();
+          const name = this.expectIdent().text;
+          this.expectPunct('(');
+          const args = this.parseArgs(')');
+          this.expectPunct(';');
+          return [{ k: 'dbConnection', name, args, pos }];
+        }
+        case 'DBupdate':
+        case 'DBUpdate':
+        case 'DBexecute':
+        case 'DBExecute': {
+          this.next();
+          this.expectPunct('(');
+          const conn = this.expectIdent().text;
+          this.expectPunct(',');
+          const sql = this.parseExpr();
+          this.expectPunct(')');
+          let e: Expr | null = null;
+          if (/update/i.test(t.text)) {
+            this.expectPunct('(');
+            e = this.parseExpr();
+            this.expectPunct(')');
+          }
+          this.expectPunct(';');
+          return [{ k: 'dbUpdate', conn, sql, e, pos }];
+        }
         case 'SheetConnection': {
           this.next();
           const name = this.expectIdent().text;
@@ -557,8 +798,49 @@ class Parser {
         }
       }
     }
+    if (t.kind === 'ident' && RESOURCE_KINDS.has(t.text) && this.isIdent(undefined, 1)) {
+      this.next();
+      const out: Stmt[] = [];
+      do {
+        const rpos = this.pos;
+        const name = this.expectIdent().text;
+        const dims = this.parseDims();
+        const args = this.acceptPunct('(') ? this.parseArgs(')') : [];
+        out.push({ k: 'resource', kind: t.text as ResourceDeclKind, name, dims, args, pos: rpos });
+      } while (this.acceptPunct(','));
+      this.expectPunct(';');
+      return out;
+    }
     if (!this.isTypeStart()) this.unexpected('a declaration or statement');
     return [this.parseDataDecl()];
+  }
+
+  /** dvar interval a[dims] [optional] [in lo..hi] [size s]; */
+  private parseIntervalVars(modern: boolean): Stmt[] {
+    const out: Stmt[] = [];
+    do {
+      const pos = this.pos;
+      const name = this.expectIdent().text;
+      const dims = this.parseDims();
+      const spec = { optional: false, window: null as Expr | null, size: null as Expr | null };
+      for (;;) {
+        if (this.acceptIdent('optional')) {
+          if (this.acceptPunct('(')) {
+            this.parseExpr();
+            this.expectPunct(')');
+          }
+          spec.optional = true;
+        } else if (this.acceptIdent('in')) spec.window = this.parseRange();
+        else if (this.acceptIdent('size')) spec.size = this.parseRange();
+        else if (this.isIdent('intensity')) {
+          this.next();
+          this.parseRange();
+        } else break;
+      }
+      out.push({ k: 'var', type: { k: 'int', nonneg: true }, name, dims, domain: null, modern, interval: spec, pos });
+    } while (this.acceptPunct(','));
+    this.expectPunct(';');
+    return out;
   }
 
   private parseDataDecl(): Stmt {
@@ -566,17 +848,27 @@ class Parser {
     const type = this.parseType();
     const name = this.expectIdent().text;
     const dims = this.parseDims();
+    // `{Arc} arcs with o in Nodes, d in Nodes = ...;` (referential integrity, not checked)
+    if (this.acceptIdent('with')) {
+      do {
+        this.expectIdent();
+        while (this.acceptPunct(',')) this.expectIdent();
+        this.expectIdent('in');
+        this.parseRange();
+      } while (this.acceptPunct(','));
+    }
     let init: DataInit | null = null;
     if (this.acceptPunct('=')) {
       init = this.acceptPunct('...') ? { k: 'external' } : { k: 'expr', e: this.parseExpr() };
     } else if (this.acceptIdent('from')) {
-      this.expectIdent('SheetRead');
+      const src = this.expectIdent().text;
+      if (src !== 'SheetRead' && !/^DBread$/i.test(src)) fail(`expected SheetRead or DBread, found '${src}'`, this.pos);
       this.expectPunct('(');
       const conn = this.expectIdent().text;
       this.expectPunct(',');
       const range = this.parseExpr();
       this.expectPunct(')');
-      init = { k: 'sheet', conn, range };
+      init = src === 'SheetRead' ? { k: 'sheet', conn, range } : { k: 'db', conn, sql: range };
     } else if (this.acceptPunct('<<')) {
       init = { k: 'prompt', text: this.expectString() };
     } else if (this.acceptPunct('<')) {
@@ -630,28 +922,169 @@ class Parser {
     }
     if (this.isPunct('{')) return this.parseCBlock();
     let label: Expr | null = null;
-    let e = this.parseExpr();
+    let e = this.parseConstraintExpr();
     if (this.acceptPunct(':')) {
       label = e;
-      e = this.parseExpr();
+      // A label before forall or a block names every constraint inside it.
+      if (((this.isIdent('forall') || this.isIdent('if')) && this.isPunct('(', 1)) || this.isPunct('{')) {
+        const body = this.parseCStmt();
+        return body.map((c) => applyLabel(c, label!));
+      }
+      e = this.parseConstraintExpr();
     }
+    const level = this.isIdent() && FILTER_LEVELS.has(this.peek().text) ? this.next().text : undefined;
     // OPL 3 accepts a missing ';' before the closing brace of a block.
     if (!this.isPunct('}')) this.expectPunct(';');
-    return [{ k: 'constraint', label, e, pos }];
+    return [{ k: 'constraint', label, e, level, pos }];
+  }
+
+  /** An expression, or a scheduling constraint written infix (`a precedes b`, `a requires(2) r`). */
+  private parseConstraintExpr(): Expr {
+    const e = this.parseExpr();
+    if (!this.isIdent() || !INFIX_CONSTRAINTS.has(this.peek().text)) return e;
+    const op = this.next();
+    let amount: Expr | null = null;
+    if (op.text !== 'precedes' && this.isPunct('(')) {
+      this.next();
+      amount = this.parseExpr();
+      this.expectPunct(')');
+    }
+    const other = this.parseExpr();
+    return { k: 'call', fn: op.text, args: amount ? [e, other, amount] : [e, other], pos: op.pos };
+  }
+
+  // ------------------------------------------------------------ search procedures
+
+  private parseSBlock(): SStmt[] {
+    if (this.acceptPunct('{')) {
+      const body: SStmt[] = [];
+      while (!this.acceptPunct('}')) {
+        if (this.acceptPunct(';')) continue;
+        body.push(...this.parseSStmt());
+      }
+      this.acceptPunct(';');
+      return body;
+    }
+    return this.parseSStmt();
+  }
+
+  /** Statements up to (not including) one of the given keywords. */
+  private parseSUntil(stop: string[]): SStmt[] {
+    const body: SStmt[] = [];
+    while (!(this.isIdent() && stop.includes(this.peek().text))) {
+      if (this.atEnd()) this.unexpected(`'${stop[stop.length - 1]}'`);
+      if (this.acceptPunct(';')) continue;
+      body.push(...this.parseSStmt());
+    }
+    return body;
+  }
+
+  private parseSStmt(): SStmt[] {
+    const t = this.peek();
+    const pos = t.pos;
+    if (this.isPunct('{')) return this.parseSBlock();
+    if (t.kind === 'ident') {
+      switch (t.text) {
+        case 'forall':
+        case 'tryall':
+        case 'select':
+          if (this.isPunct('(', 1)) {
+            this.next();
+            this.next();
+            const q = this.parseQuantifier(')');
+            return [{ k: t.text, q, body: this.parseSBlock(), pos }];
+          }
+          break;
+        case 'try': {
+          this.next();
+          const alts: SStmt[][] = [];
+          do {
+            alts.push(this.parseAlternative());
+          } while (this.acceptPunct('|'));
+          this.expectIdent('endtry');
+          this.acceptPunct(';');
+          return [{ k: 'try', alts, pos }];
+        }
+        case 'if': {
+          this.next();
+          const c = this.parseExpr();
+          if (this.acceptIdent('then')) {
+            const then = this.parseSUntil(['else', 'endif']);
+            const els = this.acceptIdent('else') ? this.parseSUntil(['endif']) : [];
+            this.expectIdent('endif');
+            this.acceptPunct(';');
+            return [{ k: 'if', c, then, else: els, pos }];
+          }
+          const then = this.parseSBlock();
+          const els = this.acceptIdent('else') ? this.parseSBlock() : [];
+          return [{ k: 'if', c, then, else: els, pos }];
+        }
+        case 'while': {
+          this.next();
+          const c = this.parseExpr();
+          this.acceptIdent('do');
+          return [{ k: 'while', c, body: this.parseSBlock(), pos }];
+        }
+      }
+      if (STRATEGIES.has(t.text)) {
+        this.next();
+        const args = this.acceptPunct('(') ? this.parseArgs(')') : [];
+        return [{ k: 'strategy', name: t.text, args, body: this.parseSBlock(), pos }];
+      }
+    }
+    const e = this.parseConstraintExpr();
+    if (!this.isPunct('}')) this.expectPunct(';');
+    return [{ k: 'post', e, pos }];
+  }
+
+  /** One alternative of try ... | ... endtry. */
+  private parseAlternative(): SStmt[] {
+    const pos = this.pos;
+    if (this.isPunct('{')) return this.parseSBlock();
+    if (this.isIdent() && ['forall', 'tryall', 'select', 'try', 'if', 'while'].includes(this.peek().text)) return this.parseSStmt();
+    const e = this.parseConstraintExpr();
+    this.acceptPunct(';');
+    return [{ k: 'post', e, pos }];
   }
 
   // ------------------------------------------------------------ data files
 
   parseData(file: string): DataAst {
     const entries: DataAst['entries'] = [];
+    const connections: NonNullable<DataAst['connections']> = [];
+    const writes: NonNullable<DataAst['writes']> = [];
     while (!this.atEnd()) {
       if (this.acceptPunct(';')) continue;
       const t = this.expectIdent();
-      this.expectPunct('=');
-      entries.push({ name: t.text, value: this.parseDataValue(), pos: t.pos });
+      if (t.text === 'prepare' && this.peek().kind === 'script') {
+        // prepare { ... } adjusts data sources with a script; not needed here.
+        this.next();
+        continue;
+      }
+      if (/^(SheetConnection|DBConnection|DBconnection)$/.test(t.text)) {
+        const name = this.expectIdent().text;
+        this.expectPunct('(');
+        const args = this.parseArgs(')');
+        this.expectPunct(';');
+        connections.push({ kind: t.text === 'SheetConnection' ? 'sheet' : 'db', name, args, pos: t.pos });
+        continue;
+      }
+      if (this.acceptIdent('from')) {
+        entries.push({ name: t.text, value: this.parsePostfixExpr(), pos: t.pos });
+      } else if (this.acceptIdent('to')) {
+        writes.push({ name: t.text, call: this.parsePostfixExpr(), pos: t.pos });
+      } else {
+        this.expectPunct('=');
+        entries.push({ name: t.text, value: this.parseDataValue(), pos: t.pos });
+      }
       if (!this.atEnd()) this.expectPunct(';');
     }
-    return { file, entries };
+    return { file, entries, connections, writes };
+  }
+
+  /** A call such as SheetRead(conn, "A1:B2"). */
+  private parsePostfixExpr(): Expr {
+    return this.parsePostfix();
   }
 
   parseDataValue(): Expr {
@@ -738,6 +1171,31 @@ class Parser {
           const editMode = this.acceptIdent('editMode');
           this.expectPunct(';');
           return [{ k: 'model', name, files, editMode, pos }];
+        }
+        case 'import': {
+          this.next();
+          const kind = this.isIdent('enum') ? this.next().text : 'data';
+          const name = this.expectIdent().text;
+          const from = this.parseExpr();
+          this.expectPunct(';');
+          return [{ k: 'import', kind, name, from, pos }];
+        }
+        case 'enum': {
+          this.next();
+          const name = this.expectIdent().text;
+          this.acceptPunct('=');
+          const values = this.parseEnumValues();
+          this.expectPunct(';');
+          return [{ k: 'enum', name, values, pos }];
+        }
+        case 'Basis':
+        case 'Solution':
+        case 'MipStart': {
+          this.next();
+          const name = this.expectIdent().text;
+          const args = this.acceptPunct('(') ? this.parseArgs(')') : [];
+          this.expectPunct(';');
+          return [{ k: 'object', type: t.text, name, args, pos }];
         }
         case 'ofile': {
           this.next();
@@ -827,6 +1285,12 @@ class Parser {
     this.expectPunct(';');
     return [{ k: 'expr', e, pos }];
   }
+}
+
+function applyLabel(c: CStmt, label: Expr): CStmt {
+  if (c.k === 'forall') return { ...c, label: c.label ?? label };
+  if (c.k === 'constraint') return { ...c, label: c.label ?? label };
+  return { ...c, then: c.then.map((x) => applyLabel(x, label)), else: c.else.map((x) => applyLabel(x, label)) };
 }
 
 export function parseModel(src: string, file: string): ModelAst {
