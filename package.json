@@ -1,0 +1,27 @@
+{
+  "name": "opl-ts",
+  "version": "0.1.0",
+  "description": "An implementation of the ILOG OPL 3.x modeling language (models, data files, projects and OPLScript) in TypeScript, with a built-in simplex / branch-and-bound solver",
+  "type": "module",
+  "bin": {
+    "opl": "dist/src/cli.js"
+  },
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test dist/test/*.test.js",
+    "tutorial": "tsc -p . && node dist/src/run-tutorial.js tutorial/files",
+    "opl": "node dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  }
+}

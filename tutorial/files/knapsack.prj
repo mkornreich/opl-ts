@@ -1,0 +1,10 @@
+callback_rate = 0.5
+dta_font = "StockedSystemFixed"
+edt_font = "StockedSystemFixed"
+hide_zero = 1
+nodeSel = 0
+output_font = "StockedSystemFixed"
+searchStrategy_I = 3
+shw_font = "StockedDefaultGui"
+MODEL = "knapsack.mod"
+DATA = "knapsack.dat"

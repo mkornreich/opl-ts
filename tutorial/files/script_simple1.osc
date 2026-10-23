@@ -1,0 +1,16 @@
+ofile out_f("E:\Program Files\examples\opl\Tutorial-1.203J\ouput.txt");
+Model simple("simple5.mod","simple5.dat") editMode;
+float+ cost := simple.c[1];
+float+ xv[1..2];
+forall (i in 1..4){
+   simple.c[1] := cost;
+   simple.solve();
+   cout << "Objective Function: " << simple.objectiveValue() << endl;
+   cout << "CPU: " << simple.getTime() << endl;
+   forall(i in 1..2){
+   out_f << i <<":  " << simple.x[i] << endl;
+   }
+   simple.reset();
+   cost := cost + 20;
+}
+out_f.close();

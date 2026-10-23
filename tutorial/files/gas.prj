@@ -1,0 +1,4 @@
+callback_rate = 0.5
+hide_zero = 1
+MODEL = "gas.mod"
+DATA = "gas.dat"
