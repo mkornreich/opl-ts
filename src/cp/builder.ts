@@ -29,9 +29,10 @@ interface ResourceUse {
 
 const NEGATE: Record<CmpOp, CmpOp> = { '<=': '>', '<': '>=', '>=': '<', '>': '<=', '=': '!=', '!=': '=' };
 
+/** Finite bounds for constraint programming: infinite bounds become +-maxint (or +-1e9 for floats). */
 export function clampBounds(lb: number, ub: number, isInt: boolean): [number, number] {
   const big = isInt ? CP_MAXINT : CP_FLOAT_BOUND;
-  return [Math.max(lb, -big), Math.min(ub, big)];
+  return [isFinite(lb) ? lb : -big, isFinite(ub) ? ub : big];
 }
 
 export class CPBuilder {
@@ -76,7 +77,7 @@ export class CPBuilder {
   varOf(e: Linear | DVar): number {
     if (typeof e === 'number') return this.constant(e);
     if (e instanceof DVar) return e.id;
-    const f = this.lin(e);
+    const f = this.lin(e, false);
     if (f.vars.length === 0) return this.constant(f.c);
     if (f.vars.length === 1 && f.coefs[0] === 1 && f.c === 0) return f.vars[0];
     let lo = f.c;
@@ -91,7 +92,8 @@ export class CPBuilder {
     return z;
   }
 
-  lin(e: Linear): LinForm {
+  /** e as coefficients over store variables; scale multiplies integer expressions with rational coefficients to integer ones (only for comparisons with 0). */
+  lin(e: Linear, scale = true): LinForm {
     const le = LinExpr.of(e);
     const coefs: number[] = [];
     const vars: number[] = [];
@@ -103,7 +105,7 @@ export class CPBuilder {
       if (!Number.isInteger(c) || this.store.real[id]) integral = false;
     }
     let c = le.constant;
-    if (!integral && vars.every((v) => !this.store.real[v])) {
+    if (scale && !integral && vars.every((v) => !this.store.real[v])) {
       // Scale rational coefficients of integer expressions to integers.
       for (let k = 2; k <= 1_000_000; k *= k < 1000 ? 2 : 10) {
         if ([...coefs, c].every((a) => Math.abs(a * k - Math.round(a * k)) < 1e-9 * Math.max(1, Math.abs(a * k)))) {
@@ -325,7 +327,7 @@ export class CPBuilder {
         this.reify(def.cons, v(def.b));
         return;
       case 'linear': {
-        const f = this.lin(def.e);
+        const f = this.lin(def.e, false);
         this.addProp(new LinearProp([...f.coefs, -1], [...f.vars, v(def.z)], f.c, true));
         return;
       }

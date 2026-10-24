@@ -7,6 +7,7 @@ import type { Binder, Dim, Expr, Quantifier, TypeExpr } from './ast.js';
 import { fail, type SourcePos } from './errors.js';
 import { Activity, CPConstraint, Flattener, isIntegral, linBounds, Resource, type CmpOp, type CPCons, type CPHooks } from './cp/terms.js';
 import { ConstraintRef, DVar, isLinear, LinExpr, linAdd, linMul, type Linear } from './linear.js';
+import { checkMemory } from './solver/memory.js';
 import {
   arrayType, asIndexSet, elementsOf, elementType, EnumType, FLOAT, formatValue, INT, indexType,
   isIntType, isNumericType, keyOf, NamedTuple, OplArray, OplRange, OplSet, OplTuple, RawArray,
@@ -1205,6 +1206,7 @@ export class Evaluator {
     const scope = new Scope(s);
     const run = (bi: number): void => {
       if (bi === binders.length) {
+        checkMemory();
         fn(scope);
         return;
       }
@@ -1438,7 +1440,10 @@ export class Evaluator {
     });
     const path: Value[] = [];
     const rec = (k: number): Value => {
-      if (k === sets.length) return leaf(scope, path);
+      if (k === sets.length) {
+        checkMemory();
+        return leaf(scope, path);
+      }
       const set = sets[k];
       const items: Value[] = new Array(set.size);
       for (let i = 0; i < set.size; i++) {
@@ -1452,6 +1457,45 @@ export class Evaluator {
       return new OplArray(set, items);
     };
     return rec(0);
+  }
+
+  /**
+   * buildArray whose cells are made on first access (dexpr arrays over large
+   * index spaces): the items are a proxy that fills itself in.
+   */
+  buildLazyArray(dims: Dim[], sets: IndexSet[], s: Scope, leaf: (scope: Scope, path: Value[]) => Value): Value {
+    const scope = new Scope(s);
+    const slots = dims.map((d, k) => {
+      if (!d.name) return null;
+      const slot: Binding = { value: 0, type: elementType(UNKNOWN, sets[k] as Value), iterator: true };
+      scope.define(d.name, slot);
+      return slot;
+    });
+    const cell = (path: Value[]): Value => {
+      path.forEach((key, k) => {
+        const slot = slots[k];
+        if (slot) slot.value = key;
+      });
+      return leaf(scope, path);
+    };
+    const level = (k: number, path: Value[]): OplArray => {
+      const set = sets[k];
+      const target: Value[] = new Array(set.size);
+      const items = new Proxy(target, {
+        get: (t, p, r) => {
+          if (typeof p === 'string' && p.charCodeAt(0) >= 48 && p.charCodeAt(0) <= 57) {
+            const i = Number(p);
+            if (Number.isInteger(i) && i < set.size && t[i] === undefined) {
+              const at = [...path, set.at(i)];
+              t[i] = k + 1 === sets.length ? cell(at) : level(k + 1, at);
+            }
+          }
+          return Reflect.get(t, p, r);
+        },
+      });
+      return new OplArray(set, items);
+    };
+    return level(0, []);
   }
 
   // ------------------------------------------------------------ shaping

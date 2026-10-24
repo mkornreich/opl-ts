@@ -14,10 +14,12 @@ options:
   -a, --all-vars      list all decision variables, even when the model has display statements
   -z, --hide-zero     do not list variables whose value is zero
       --node-sel N    branch-and-bound node selection: 0 = depth-first, 1 = best-bound
-      --time-limit S  stop branch and bound after S seconds
+      --time-limit S  stop solving after S seconds in all (every solve of a script shares them)
       --export-lp F   also write the generated problem to F in CPLEX LP format
       --cp            solve with constraint programming even if the model is linear
       --all-solutions constraint programming without objective: print every solution
+      --allow-exec    let scripts run shell commands with IloOplExec
+      --memory-limit MB  memory the solvers may use (default 2048)
   -h, --help          show this help
 `;
 
@@ -77,6 +79,12 @@ function main(argv: string[]): number {
         break;
       case '--all-solutions':
         options.allSolutions = true;
+        break;
+      case '--allow-exec':
+        options.allowExec = true;
+        break;
+      case '--memory-limit':
+        process.env.OPL_MEMORY_LIMIT_MB = String(value());
         break;
       case '--export-lp':
         options.exportLp = argv[++i];

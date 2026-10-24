@@ -9,6 +9,9 @@
  * - meta-constraints and logical constraints (=>, or, not, !=) become
  *   indicator-style big-M rows.
  *
+ * - other products of two variables whose result only appears in the
+ *   objective are left to the QP solver (listed in input.quadratic).
+ *
  * Returns null when something needs constraint programming (alldifferent,
  * scheduling, general products, unbounded big-M terms, ...).
  */
@@ -31,6 +34,15 @@ export interface LinearizeInput {
   objective: LinExpr;
   sense: 'minimize' | 'maximize' | null;
   newVar(lo: number, hi: number, isInt: boolean, name: string): DVar;
+  /** When given, receives the products z = x * y left for a quadratic objective. */
+  quadratic?: QuadTerm[];
+}
+
+/** z = a * b, the factors expanded through the linear definitions of auxiliary variables. */
+export interface QuadTerm {
+  z: DVar;
+  a: LinExpr;
+  b: LinExpr;
 }
 
 /** Tolerance used for strict inequalities over continuous expressions. */
@@ -101,6 +113,52 @@ class Linearizer {
 
   private bin(name: string): DVar {
     return this.inp.newVar(0, 1, true, name);
+  }
+
+  /** How often each variable appears outside the objective and its own definition. */
+  private uses: Map<number, number> | null = null;
+
+  private usedOutsideObjective(z: DVar): boolean {
+    if (!this.uses) {
+      const uses = new Map<number, number>();
+      const count = (v: unknown, skip: DVar | null): void => {
+        if (v instanceof DVar) {
+          if (v !== skip) uses.set(v.id, (uses.get(v.id) ?? 0) + 1);
+        } else if (v instanceof LinExpr) {
+          for (const [id, c] of v.terms) if (c !== 0 && id !== skip?.id) uses.set(id, (uses.get(id) ?? 0) + 1);
+        } else if (Array.isArray(v)) {
+          for (const x of v) count(x, skip);
+        } else if (v && typeof v === 'object') {
+          for (const x of Object.values(v)) count(x, skip);
+        }
+      };
+      for (const r of this.inp.rows) count(r.expr, null);
+      for (const d of this.inp.defs) count(d, 'z' in d ? d.z : null);
+      for (const c of this.inp.cons) count(c, null);
+      this.uses = uses;
+    }
+    return (this.uses.get(z.id) ?? 0) > 0;
+  }
+
+  private linearDefs: Map<number, LinExpr> | null = null;
+
+  /** x in terms of decision variables: auxiliary variables of linear definitions are replaced. */
+  private expand(x: DVar): LinExpr {
+    if (!this.linearDefs) {
+      this.linearDefs = new Map();
+      for (const d of this.inp.defs) if (d.k === 'linear') this.linearDefs.set(d.z.id, LinExpr.of(d.e));
+    }
+    const out = new LinExpr();
+    const add = (e: LinExpr, f: number, depth: number) => {
+      out.constant += f * e.constant;
+      for (const [id, c] of e.terms) {
+        const def = depth < 8 ? this.linearDefs!.get(id) : undefined;
+        if (def) add(def, f * c, depth + 1);
+        else out.addScaled(this.v(id), f * c);
+      }
+    };
+    add(LinExpr.of(x), 1, 0);
+    return out;
   }
 
   run(): LinRow[] {
@@ -218,6 +276,10 @@ class Linearizer {
       this.row(this.lin(z).addScaled(x, -1), -Infinity, 0);
       this.row(this.lin(z).addScaled(y, -1), -Infinity, 0);
       this.row(this.lin(z).addScaled(x, -1).addScaled(y, -1), -1, Infinity);
+      return;
+    }
+    if (!this.isBinary(x) && !this.isBinary(y) && this.inp.quadratic && !this.usedOutsideObjective(z)) {
+      this.inp.quadratic.push({ z, a: this.expand(x), b: this.expand(y) });
       return;
     }
     const [b, v] = this.isBinary(y) ? [y, x] : this.isBinary(x) ? [x, y] : this.no();

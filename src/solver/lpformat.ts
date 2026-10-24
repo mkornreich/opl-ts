@@ -3,6 +3,7 @@
  */
 
 import type { LinearProgram } from './lp.js';
+import type { Hessian } from './qp.js';
 
 /** LP-format safe, unique names. */
 function sanitize(names: string[], prefix: string): string[] {
@@ -40,6 +41,7 @@ export function toLpFormat(
   varNames: string[],
   rowNames: string[],
   title = '',
+  hessian: Hessian | null = null,
 ): string {
   const names = sanitize(varNames, 'x');
   const rows = sanitize(rowNames, 'c');
@@ -57,7 +59,20 @@ export function toLpFormat(
     }
   });
   const constant = s * lp.objConstant;
-  out.push(` obj: ${objIdx.length ? linear(objIdx, objVal, names) : ''}${constant ? ` ${constant < 0 ? '-' : '+'} ${num(Math.abs(constant))}` : ''}`.trimEnd());
+  // Quadratic part: [ sum of h x_i x_j ] / 2 with the full (doubled) off-diagonal coefficients.
+  let quad = '';
+  if (hessian && hessian.v.length) {
+    const terms: string[] = [];
+    for (let k = 0; k < hessian.v.length; k++) {
+      const [i, j] = [hessian.i[k], hessian.j[k]];
+      const c = s * hessian.v[k] * (i === j ? 1 : 2);
+      if (c === 0) continue;
+      const t = i === j ? `${names[i]} ^ 2` : `${names[i]} * ${names[j]}`;
+      terms.push(`${terms.length === 0 && c > 0 ? '' : c < 0 ? '- ' : '+ '}${num(Math.abs(c))} ${t}`);
+    }
+    if (terms.length) quad = ` + [ ${terms.join(' ')} ] / 2`;
+  }
+  out.push(` obj: ${objIdx.length ? linear(objIdx, objVal, names) : ''}${quad}${constant ? ` ${constant < 0 ? '-' : '+'} ${num(Math.abs(constant))}` : ''}`.trimEnd());
   out.push('Subject To');
   lp.rows.forEach((r, i) => {
     const body = linear(r.index, r.value, names);

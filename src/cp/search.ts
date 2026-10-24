@@ -16,6 +16,7 @@ import { CPBuilder } from './builder.js';
 import { Linear as LinearProp, ReifLinear } from './propagators.js';
 import { Disjunctive, NotFirst } from './sched.js';
 import { Dom } from './domain.js';
+import { memoryExceeded } from '../solver/memory.js';
 import { Activity, CPConstraint, Flattener, Resource, type CPCons, type CPDef, type CPHooks } from './terms.js';
 
 type K = () => boolean;
@@ -40,6 +41,8 @@ export interface CPProblem {
 export interface CPOptions {
   timeLimit?: number;
   allSolutions?: boolean;
+  /** Stop enumerating after this many solutions. */
+  maxSolutions?: number;
 }
 
 export interface CPResult {
@@ -96,7 +99,7 @@ export function solveCP(p: CPProblem, options: CPOptions = {}): CPResult {
       s.objBound = v - (step || Math.max(1e-9, 1e-6 * Math.abs(v)));
       return false;
     }
-    return !options.allSolutions;
+    return !options.allSolutions || result.solutions.length >= (options.maxSolutions ?? Infinity);
   };
 
   const ev = p.ev;
@@ -200,7 +203,7 @@ class Search {
 
   private timeUp(): boolean {
     if (this.limitHit) return true;
-    if ((this.s.choicePoints & 255) === 0 && performance.now() > this.deadline) this.limitHit = true;
+    if ((this.s.choicePoints & 255) === 0 && (performance.now() > this.deadline || memoryExceeded())) this.limitHit = true;
     return this.limitHit;
   }
 
@@ -245,22 +248,84 @@ class Search {
     return false;
   }
 
-  /** Labels vars, smallest domain first (firstFail) or in order. */
+  /**
+   * Labels vars, smallest domain first (firstFail) or in order, then calls k.
+   * An explicit stack instead of recursion: models label thousands of variables.
+   */
   private label(vars: number[], firstFail: boolean, k: K): boolean {
     const s = this.s;
-    const next = (): boolean => {
+    interface Frame {
+      v: number;
+      /** The values still to try (lazily: domains can be huge), or null for the two halves of a float variable. */
+      values: Iterator<number> | null;
+      mid: number;
+      i: number;
+      mark: number;
+      saved: number;
+    }
+    const stack: Frame[] = [];
+    let stop = false;
+    const pick = (): number => {
+      // A float variable is split until it is bound, as before.
+      const top = stack[stack.length - 1];
+      if (top && top.values === null && !s.isBound(top.v)) return top.v;
       let best = -1;
       for (const v of vars) {
         if (v >= s.numVars || s.isBound(v)) continue;
-        if (!firstFail) {
-          best = v;
-          break;
-        }
+        if (!firstFail) return v;
         if (best < 0 || s.size(v) < s.size(best)) best = v;
       }
-      return best < 0 ? k() : this.labelVar(best, next);
+      return best;
     };
-    return next();
+    /** Applies the frame's next alternative; false when none is left (or the search stops). */
+    const advance = (f: Frame): boolean => {
+      for (;;) {
+        let val = 0;
+        if (f.values) {
+          const r = f.values.next();
+          if (r.done) return false;
+          val = r.value;
+        } else if (f.i >= 2) return false;
+        if (this.timeUp()) {
+          stop = true;
+          return false;
+        }
+        if (f.i > 0 && this.discrepancies >= this.discrepancyLimit) return false;
+        f.mark = s.mark();
+        f.saved = this.discrepancies;
+        if (f.i > 0) this.discrepancies++;
+        const i = f.i++;
+        s.choicePoints++;
+        const ok = f.values ? s.assign(f.v, val) : i === 0 ? s.setMax(f.v, f.mid) : s.setMin(f.v, f.mid);
+        if (ok && s.propagate()) return true;
+        s.restore(f.mark);
+        this.discrepancies = f.saved;
+      }
+    };
+    for (;;) {
+      const v = pick();
+      let descended = false;
+      if (v < 0) {
+        if (k()) return true;
+      } else {
+        const f: Frame = { v, values: s.real[v] ? null : s.dom(v).values(), mid: (s.min(v) + s.max(v)) / 2, i: 0, mark: s.mark(), saved: 0 };
+        stack.push(f);
+        descended = advance(f);
+        if (stop) return true;
+        if (!descended) stack.pop();
+      }
+      if (descended) continue;
+      // Backtrack: undo the deepest choice and try its next alternative.
+      for (;;) {
+        const f = stack[stack.length - 1];
+        if (!f) return false;
+        s.restore(f.mark);
+        this.discrepancies = f.saved;
+        if (advance(f)) break;
+        if (stop) return true;
+        stack.pop();
+      }
+    }
   }
 
   /** Schedules activities by start time, earliest start first. */

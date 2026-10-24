@@ -127,24 +127,35 @@ class Parser {
   }
 
   private parseCompare(): Expr {
-    const first = this.parseRange();
+    const first = this.parseIn();
     const ops: string[] = [];
     const exprs: Expr[] = [first];
     for (;;) {
       const t = this.peek();
       let op: string | null = null;
       if (t.kind === 'punct' && COMPARISON.has(t.text)) op = t.text;
-      else if (this.isIdent('in')) op = 'in';
-      else if (this.isIdent('not') && this.isIdent('in', 1)) op = 'not in';
       if (!op) break;
       this.next();
-      if (op === 'not in') this.next();
       ops.push(op === '==' ? '=' : op === '<>' ? '!=' : op);
-      exprs.push(this.parseRange());
+      exprs.push(this.parseIn());
     }
     if (ops.length === 0) return first;
     if (ops.length === 1) return { k: 'bin', op: ops[0], l: exprs[0], r: exprs[1], pos: first.pos };
     return { k: 'chain', ops, exprs, pos: first.pos };
+  }
+
+  /** x in S binds tighter than comparisons: 0 == <o,d> in S  is  0 == (<o,d> in S). */
+  private parseIn(): Expr {
+    let l = this.parseRange();
+    for (;;) {
+      let op: string | null = null;
+      if (this.isIdent('in')) op = 'in';
+      else if (this.isIdent('not') && this.isIdent('in', 1)) op = 'not in';
+      if (!op) return l;
+      const pos = this.next().pos;
+      if (op === 'not in') this.next();
+      l = { k: 'bin', op, l, r: this.parseRange(), pos };
+    }
   }
 
   parseRange(): Expr {

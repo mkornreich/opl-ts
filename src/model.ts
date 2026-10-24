@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import type { CStmt, DataAst, Expr, ModelAst, SStmt, Stmt } from './ast.js';
 import { IlogRuntime } from './ilog.js';
 import { clampBounds } from './cp/builder.js';
-import { linearize } from './cp/linearize.js';
+import { linearize, type QuadTerm } from './cp/linearize.js';
 import { solveCP } from './cp/search.js';
 import { Activity, CP_MAXINT, CPConstraint, Flattener, Resource, type CPCons, type CPDef, type CPHooks } from './cp/terms.js';
 import { DBConnection } from './db.js';
@@ -27,6 +27,7 @@ import { SheetConnection } from './sheet.js';
 import { solveMIP } from './solver/mip.js';
 import type { LinearProgram, MIPStatus } from './solver/lp.js';
 import { toLpFormat } from './solver/lpformat.js';
+import { isConvex, solveMIQP, type Hessian } from './solver/qp.js';
 import { clean } from './solver/simplex.js';
 import {
   arrayType, elementsOf, EnumType, formatValue, indexType, keyOf, OplArray, OplRange, OplSet, OplTuple, RawArray,
@@ -45,7 +46,12 @@ export interface ModelOptions {
   input?: (prompt: string) => string | null;
   /** CPLEX nodeSel: 0 = depth-first, 1 = best-bound. */
   nodeSelection?: number;
+  /** Allow IloOplExec in scripts to run shell commands. */
+  allowExec?: boolean;
+  /** Seconds per solve (CPLEX tilim). */
   timeLimit?: number;
+  /** performance.now() time that bounds every solve of the run (--time-limit). */
+  deadline?: number;
   /** Solve with constraint programming even when the model is linear. */
   forceCP?: boolean;
   /** Constraint programming without objective: enumerate every solution. */
@@ -56,7 +62,7 @@ export type SolveStatus = MIPStatus | 'none';
 
 export interface SolveInfo {
   status: SolveStatus;
-  solver: 'LP' | 'MIP' | 'CP';
+  solver: 'LP' | 'MIP' | 'QP' | 'MIQP' | 'CP';
   sense: 'minimize' | 'maximize' | null;
   objective: number;
   objectiveType: Type;
@@ -99,6 +105,8 @@ export class ModelInstance implements HostObject {
   private varNames: string[] = [];
   private decision: DVar[] = [];
   private rows: GeneratedRow[] = [];
+  /** Products z = x * y of a quadratic objective (z is a placeholder column). */
+  private quad: QuadTerm[] = [];
   private cpCons: CPCons[] = [];
   private cpDefs: CPDef[] = [];
   private cpRefs: ConstraintRef[] = [];
@@ -255,8 +263,47 @@ export class ModelInstance implements HostObject {
     return new ModelInstance(ast, [], { ...this.options, write: this.write, out: this.out, warn: this.warn });
   }
 
+  /**
+   * thisOplModel.generate(): the model is generated once and kept, so that
+   * scripts can change it (ct.setCoef, ct.LB, cplex.setObjCoef) between solves.
+   */
   scriptGenerate(): void {
     this.initData();
+    this.generate();
+    const obj = this.objectiveExpr();
+    this.tryLinearize(obj);
+    this.kept = { obj };
+  }
+
+  private kept: { obj: LinExpr } | null = null;
+
+  private rowOf(ref: ConstraintRef): GeneratedRow {
+    const row = this.rows.find((r) => r.ref === ref);
+    if (!row) fail(`${ref.name} is not a linear constraint of the generated model`);
+    return row;
+  }
+
+  /** ct.setCoef(x, c) */
+  setRowCoef(ref: ConstraintRef, v: DVar, c: number): void {
+    this.rowOf(ref).expr.terms.set(v.id, c);
+  }
+
+  /** Bounds of a constraint row (its constant moved to the bounds, as ct.LB / ct.UB). */
+  rowBounds(ref: ConstraintRef): { lb: number; ub: number } {
+    const row = this.rowOf(ref);
+    return { lb: row.lower, ub: row.upper };
+  }
+
+  setRowBound(ref: ConstraintRef, which: 'lb' | 'ub', value: number): void {
+    const row = this.rowOf(ref);
+    if (which === 'lb') row.lower = value;
+    else row.upper = value;
+  }
+
+  /** cplex.setObjCoef(x, c) */
+  setObjCoef(v: DVar, c: number): void {
+    if (!this.kept) fail('setObjCoef needs a generated model (thisOplModel.generate())');
+    this.kept.obj.terms.set(v.id, c);
   }
 
   solveForScript(allSolutions: boolean): void {
@@ -556,6 +603,7 @@ export class ModelInstance implements HostObject {
     this.rows = [];
     this.cpCons = [];
     this.cpDefs = [];
+    this.quad = [];
     this.cpRefs = [];
     this.activities = [];
     this.selections = new Map();
@@ -596,7 +644,13 @@ export class ModelInstance implements HostObject {
       for (const d of st.dims) if (d.name) snap.define(d.name, { ...scope.lookup(d.name)! });
       return new DExpr(st.name, st.e, snap);
     };
-    const value = st.dims.length ? ev.buildArray(st.dims, sets, this.global, make) : new DExpr(st.name, st.e, this.global);
+    // Large dexpr arrays are only computed where they are used.
+    const cells = sets.reduce((a, set) => a * set.size, 1);
+    const value = !st.dims.length
+      ? new DExpr(st.name, st.e, this.global)
+      : cells > 100_000
+        ? ev.buildLazyArray(st.dims, sets, this.global, make)
+        : ev.buildArray(st.dims, sets, this.global, make);
     this.global.define(st.name, { value, type: arrayType(base, sets) });
   }
 
@@ -629,6 +683,17 @@ export class ModelInstance implements HostObject {
       rows: [],
     };
     for (const [id, c] of obj.terms) lp.objective[id] += sign * c;
+    // Products of a quadratic objective: the Hessian holds them, their linear parts go here.
+    if (this.quad.length) {
+      // (the placeholder columns themselves are pinned at 0; their values are set after solving)
+      for (const { z } of this.quad) {
+        lp.objective[z.id] = 0;
+        lp.lower[z.id] = lp.upper[z.id] = 0;
+      }
+      const q = this.quadraticPart(obj, this.quad);
+      for (const [id, c] of q.linear) lp.objective[id] += c;
+      lp.objConstant += q.constant;
+    }
     this.vars.forEach((v, j) => {
       lp.lower[j] = v.lb;
       lp.upper[j] = v.ub;
@@ -949,11 +1014,43 @@ export class ModelInstance implements HostObject {
   solve(): SolveInfo {
     const e = this.objective?.e;
     if (e?.k === 'call' && e.fn === 'staticLex') return this.solveLexicographic(e.args);
+    if (this.kept) {
+      // Generated by a script (and possibly changed since): solve it as it is.
+      const obj = this.kept.obj;
+      this.lastObjective = obj;
+      return this.usesCP ? this.solveWithCP(obj) : this.solveLinear(obj);
+    }
     this.generate();
     const obj = this.objectiveExpr();
     this.lastObjective = obj;
     this.tryLinearize(obj);
     return this.usesCP ? this.solveWithCP(obj) : this.solveLinear(obj);
+  }
+
+  /** Float variables v with an equation  v = integer combination of integer variables  (implied integers). */
+  private impliedIntegers(): Set<number> {
+    const implied = new Set<number>();
+    const isInt = (id: number) => this.vars[id].isInt || implied.has(id);
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const row of this.rows) {
+        if (row.lower !== row.upper || !Number.isInteger(row.lower - row.expr.constant)) continue;
+        let free = -1;
+        let ok = true;
+        for (const [id, c] of row.expr.terms) {
+          if (c === 0) continue;
+          if (isInt(id)) ok = Number.isInteger(c);
+          else if (free < 0 && Math.abs(c) === 1) free = id;
+          else ok = false;
+          if (!ok) break;
+        }
+        if (ok && free >= 0) {
+          implied.add(free);
+          changed = true;
+        }
+      }
+    }
+    return implied;
   }
 
   /**
@@ -966,10 +1063,15 @@ export class ModelInstance implements HostObject {
     if (!this.usesCP || this.search || this.options.forceCP || this.usingCP || this.activities.length || this.options.allSolutions) return;
     // Integer models with moderate domains are better served by the CP solver,
     // which handles logical constraints natively; continuous ones need the MIP.
-    const smallIntegers = this.decision.every((v) => v.isInt && isFinite(v.lb) && isFinite(v.ub) && Math.abs(v.lb) <= 1e6 && Math.abs(v.ub) <= 1e6);
+    // Float variables defined by an integer equation count as integers.
+    const implied = this.impliedIntegers();
+    const smallIntegers = this.decision.every(
+      (v) => implied.has(v.id) || (v.isInt && isFinite(v.lb) && isFinite(v.ub) && Math.abs(v.lb) <= 1e6 && Math.abs(v.ub) <= 1e6),
+    );
     if (smallIntegers && this.decision.length > 0) return;
     const before = this.vars.length;
     const hooks = this.hooks();
+    const quadratic: QuadTerm[] = [];
     const extra = linearize({
       vars: this.vars,
       rows: this.rows,
@@ -978,12 +1080,15 @@ export class ModelInstance implements HostObject {
       objective: obj,
       sense: this.objective?.sense ?? null,
       newVar: (lo, hi, isInt, name) => hooks.newVar(lo, hi, isInt, name),
+      quadratic,
     });
-    if (!extra) {
+    // A non-convex quadratic objective stays with the CP solver.
+    if (!extra || (quadratic.length && !isConvex(this.quadraticPart(obj, quadratic).h))) {
       this.vars.length = before;
       return;
     }
     this.rows.push(...extra);
+    this.quad = quadratic;
     this.cpDefs = [];
     this.cpCons = [];
     this.usesCP = false;
@@ -1017,12 +1122,60 @@ export class ModelInstance implements HostObject {
     return info!;
   }
 
+  /** The time limit of the next solve: its own limit, cut to what is left of the run's. */
+  private solveSeconds(): number | undefined {
+    const own = this.options.timeLimit;
+    const d = this.options.deadline;
+    if (d === undefined) return own;
+    const left = Math.max(0.001, (d - performance.now()) / 1000);
+    return own === undefined ? left : Math.min(own, left);
+  }
+
+  /**
+   * The products of a quadratic objective, minimised: the Hessian (upper
+   * triangle) and the linear and constant parts of the expanded products.
+   */
+  private quadraticPart(obj: LinExpr, quad: QuadTerm[]): { h: Hessian; linear: Map<number, number>; constant: number } {
+    const sign = this.objective?.sense === 'maximize' ? -1 : 1;
+    const entries = new Map<number, number>();
+    const n = this.vars.length;
+    const linear = new Map<number, number>();
+    let constant = 0;
+    const addLinear = (id: number, v: number) => linear.set(id, (linear.get(id) ?? 0) + v);
+    for (const { z, a, b } of quad) {
+      const c = sign * (obj.terms.get(z.id) ?? 0);
+      if (c === 0) continue;
+      for (const [i, ci] of a.terms) {
+        for (const [j, cj] of b.terms) {
+          const v = c * ci * cj;
+          if (v === 0) continue;
+          const key = Math.min(i, j) * n + Math.max(i, j);
+          entries.set(key, (entries.get(key) ?? 0) + (i === j ? 2 * v : v));
+        }
+        if (b.constant) addLinear(i, c * ci * b.constant);
+      }
+      if (a.constant) for (const [j, cj] of b.terms) addLinear(j, c * a.constant * cj);
+      constant += c * a.constant * b.constant;
+    }
+    const h: Hessian = { i: [], j: [], v: [] };
+    for (const [key, v] of entries) {
+      if (v === 0) continue;
+      h.i.push(Math.floor(key / n));
+      h.j.push(key % n);
+      h.v.push(v);
+    }
+    return { h, linear, constant };
+  }
+
   private solveLinear(obj: LinExpr): SolveInfo {
     const lp = this.linearProgram(obj);
     if (this.relaxed) lp.integer.fill(0);
     const sense = this.objective?.sense ?? null;
     const t0 = performance.now();
-    const res = solveMIP(lp, { nodeSelection: this.options.nodeSelection, timeLimit: this.options.timeLimit });
+    const h = this.quad.length ? this.quadraticPart(obj, this.quad).h : null;
+    const res = h
+      ? solveMIQP(lp, h, { timeLimit: this.solveSeconds() })
+      : solveMIP(lp, { nodeSelection: this.options.nodeSelection, timeLimit: this.solveSeconds() });
     const time = (performance.now() - t0) / 1000;
     const sign = sense === 'maximize' ? -1 : 1;
     const ok = res.status === 'optimal' || res.status === 'feasible';
@@ -1031,6 +1184,12 @@ export class ModelInstance implements HostObject {
         v.value = clean(res.x[j]) + 0;
         v.rc = clean(sign * res.reducedCosts[j]) + 0;
       });
+      const valueOf = (e: LinExpr) => {
+        let s = e.constant;
+        for (const [id, c] of e.terms) s += c * this.vars[id].value;
+        return s;
+      };
+      for (const { z, a, b } of this.quad) z.value = clean(valueOf(a) * valueOf(b)) + 0;
       this.rows.forEach((row, i) => {
         if (!row.ref) return;
         let act = 0;
@@ -1043,7 +1202,7 @@ export class ModelInstance implements HostObject {
     const numIntVars = lp.integer.reduce((a, b) => a + b, 0);
     this.lastSolve = {
       status: this.objective ? res.status : 'none',
-      solver: numIntVars > 0 ? 'MIP' : 'LP',
+      solver: h ? (numIntVars > 0 ? 'MIQP' : 'QP') : numIntVars > 0 ? 'MIP' : 'LP',
       sense,
       objective: ok ? clean(sign * res.objective) + 0 : NaN,
       objectiveType: this.objectiveType(),
@@ -1060,9 +1219,49 @@ export class ModelInstance implements HostObject {
     return this.lastSolve;
   }
 
+  /**
+   * CPLEX populate: solves, then fills the solution pool with the optimum and,
+   * when every variable is an integer, further feasible solutions found by
+   * enumeration (up to limit).  Returns the pool size.
+   */
+  populate(limit: number): number {
+    const info = this.solve();
+    if (!this.solved) return 0;
+    const best = Float64Array.from(this.vars, (v) => v.value);
+    let pool: Float64Array[] = [best];
+    const implied = this.impliedIntegers();
+    if (limit > 1 && this.vars.every((v) => v.isInt || implied.has(v.id))) {
+      const res = solveCP(
+        {
+          vars: this.vars,
+          decision: this.decision,
+          rows: this.rows,
+          cons: this.cpCons,
+          defs: this.cpDefs,
+          objective: null,
+          maximize: false,
+          activities: this.activities,
+          selections: this.selections,
+          search: null,
+          ev: this.ev,
+          scope: this.global,
+        },
+        { timeLimit: this.solveSeconds(), allSolutions: true, maxSolutions: limit },
+      );
+      const ids = this.decision.map((v) => v.id);
+      const same = (a: Float64Array) => ids.every((i) => Math.abs(a[i] - best[i]) < 1e-9);
+      pool = [best, ...res.solutions.filter((s) => !same(s))].slice(0, limit);
+    }
+    // The optimum (with its duals) stays loaded; setPoolSolution switches.
+    this.solutions = pool;
+    this.lastSolve = { ...info, solutions: pool.length };
+    return pool.length;
+  }
+
   private solveWithCP(obj: LinExpr): SolveInfo {
+    const implied = this.impliedIntegers();
     for (const v of this.vars) {
-      if (!v.isInt && !v.aux && this.decision.includes(v) && (!isFinite(v.lb) || !isFinite(v.ub))) {
+      if (!v.isInt && !v.aux && !implied.has(v.id) && this.decision.includes(v) && (!isFinite(v.lb) || !isFinite(v.ub))) {
         this.warn(`float variable ${v.name} has no finite bounds; constraint programming limits it to +-1e9`);
         break;
       }
@@ -1084,7 +1283,7 @@ export class ModelInstance implements HostObject {
         ev: this.ev,
         scope: this.global,
       },
-      { timeLimit: this.options.timeLimit, allSolutions: this.options.allSolutions && !sense },
+      { timeLimit: this.solveSeconds(), allSolutions: this.options.allSolutions && !sense },
     );
     const time = (performance.now() - t0) / 1000;
     this.solutions = res.solutions;
@@ -1146,7 +1345,8 @@ export class ModelInstance implements HostObject {
     const lp = this.linearProgram(obj);
     const rowNames = this.rows.map((r, i) => r.ref?.name ?? `c${i + 1}`);
     const title = `generated by opl-ts from ${path.basename(this.ast.file)}`;
-    return toLpFormat(lp, this.objective?.sense === 'maximize', this.vars.map((v) => v.name), rowNames, title);
+    const h = this.quad.length ? this.quadraticPart(obj, this.quad).h : null;
+    return toLpFormat(lp, this.objective?.sense === 'maximize', this.vars.map((v) => v.name), rowNames, title, h);
   }
 
   get solved(): boolean {

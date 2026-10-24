@@ -30,6 +30,8 @@ export interface RunOptions {
   forceCP?: boolean;
   /** Constraint programming without objective: print every solution. */
   allSolutions?: boolean;
+  /** Allow IloOplExec in scripts. */
+  allowExec?: boolean;
 }
 
 export interface RunResult {
@@ -43,6 +45,8 @@ export function runFile(file: string, dataFiles: string[], options: RunOptions =
   const write = options.write ?? ((t) => process.stdout.write(t));
   const warn = options.warn ?? ((m) => console.error(`warning: ${m}`));
   const ext = path.extname(file).toLowerCase();
+  // The time limit covers the whole run, however many solves a script makes.
+  const deadline = options.timeLimit ? performance.now() + options.timeLimit * 1000 : undefined;
 
   if (ext === '.osc') {
     const ast = parseScript(fs.readFileSync(file, 'utf8'), file);
@@ -51,6 +55,7 @@ export function runFile(file: string, dataFiles: string[], options: RunOptions =
       write,
       warn,
       nodeSelection: options.nodeSelection,
+      deadline,
     }).run();
     return { kind: 'script' };
   }
@@ -73,9 +78,10 @@ export function runFile(file: string, dataFiles: string[], options: RunOptions =
     warn,
     input: options.input,
     nodeSelection,
-    timeLimit: options.timeLimit,
+    deadline,
     forceCP: options.forceCP,
     allSolutions: options.allSolutions,
+    allowExec: options.allowExec,
   });
   if (model.hasMain) {
     // The main block drives generation, solving and output.
@@ -130,9 +136,9 @@ export function statsLine(info: SolveInfo): string {
     return `[CP: ${info.numVars} variables, ${info.numConstraints} constraints; ` +
       `${info.choicePoints} choice points, ${info.fails} fails; ${info.time.toFixed(3)} s]`;
   }
-  const kind = info.numIntVars > 0 ? 'MIP' : 'LP';
   const ints = info.numIntVars > 0 ? ` (${info.numIntVars} integer)` : '';
   const nodes = info.numIntVars > 0 ? `, ${info.nodes} branch-and-bound nodes` : '';
-  return `[${kind}: ${info.numVars} variables${ints}, ${info.numConstraints} constraints; ` +
-    `${info.iterations} simplex iterations${nodes}; ${info.time.toFixed(3)} s]`;
+  const what = info.solver === 'QP' || info.solver === 'MIQP' ? 'iterations' : 'simplex iterations';
+  return `[${info.solver}: ${info.numVars} variables${ints}, ${info.numConstraints} constraints; ` +
+    `${info.iterations} ${what}${nodes}; ${info.time.toFixed(3)} s]`;
 }

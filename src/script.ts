@@ -24,6 +24,8 @@ export interface ScriptOptions {
   write?: (text: string) => void;
   warn?: Warn;
   nodeSelection?: number;
+  /** performance.now() time that bounds every solve. */
+  deadline?: number;
 }
 
 class ScriptModel implements HostObject {
@@ -170,7 +172,7 @@ export class ScriptRunner {
       case 'model': {
         const dir = this.options.baseDir;
         const [first, ...rest] = st.files.map((f) => resolveInput(f, dir, this.warn, st.pos));
-        const opts = { baseDir: dir, warn: this.warn, nodeSelection: this.options.nodeSelection, out: (l: string) => this.write(l + '\n') };
+        const opts = { baseDir: dir, warn: this.warn, nodeSelection: this.options.nodeSelection, deadline: this.options.deadline, out: (l: string) => this.write(l + '\n') };
         let instance: ModelInstance;
         if (first.toLowerCase().endsWith('.prj')) {
           const prj = readProject(first, this.warn);

@@ -9,6 +9,7 @@
  * `for (x in S)`, which iterates over the elements of S, is rewritten.
  */
 
+import { execSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -105,6 +106,20 @@ export class IlogRuntime {
       write: (...a: unknown[]) => write(a.map(scriptString).join('')),
       __in: (x: unknown) => rt.iterate(x),
       Opl: this.oplNamespace(),
+      fail: () => fail('the script called fail()'),
+      IloOplExec: (command: string, wait = true) => {
+        if (!rt.model.options.allowExec) fail('IloOplExec runs shell commands; allow it with --allow-exec');
+        if (!wait) {
+          spawn(command, { shell: true, detached: true, stdio: 'ignore' }).unref();
+          return 0;
+        }
+        try {
+          write(execSync(command, { cwd: rt.model.options.baseDir, encoding: 'utf8' }));
+          return 0;
+        } catch (e) {
+          return (e as { status?: number }).status ?? 1;
+        }
+      },
       thisOplModel: this.modelObject(model),
       IloOplModelSource: function (this: { file: string }, file: string) {
         this.file = rt.resolve(file);
@@ -185,7 +200,8 @@ export class IlogRuntime {
     const shadow = new Map<string, unknown>();
     const ctx = this.context as Record<string, unknown>;
     return new Proxy({} as Record<string | symbol, unknown>, {
-      has: (_, prop) => typeof prop === 'string' && !(prop in ctx) && (shadow.has(prop) || !!m.getField(prop) || m.isGeneratedElement(prop)),
+      // Script globals shadow model elements (checked last: it is slow on the vm context).
+      has: (_, prop) => typeof prop === 'string' && (shadow.has(prop) || !!m.getField(prop) || m.isGeneratedElement(prop)) && !(prop in ctx),
       get: (_, prop) => {
         if (typeof prop !== 'string') return undefined;
         if (shadow.has(prop)) return shadow.get(prop);
@@ -230,15 +246,37 @@ export class IlogRuntime {
 
   // ------------------------------------------------------------ conversions
 
+  private readonly wrappers = new WeakMap<object, unknown>();
+
   toJS(v: Value): unknown {
     if (typeof v === 'number' || typeof v === 'string') return v;
     if (v instanceof DExpr) return this.toJS(this.model.resolveDExprs(v));
     if (v instanceof DVar) return this.dvar(v);
-    if (v instanceof OplArray) return this.arrayProxy(v);
-    if (v instanceof OplSet || v instanceof OplRange || v instanceof EnumType) return this.setObject(v);
-    if (v instanceof OplTuple) return this.tupleProxy(v);
+    if (v instanceof OplArray || v instanceof OplSet || v instanceof OplRange || v instanceof EnumType || v instanceof OplTuple) {
+      // One wrapper per value: scripts read the same elements over and over.
+      let w = this.wrappers.get(v);
+      if (w === undefined) {
+        w = v instanceof OplArray ? this.arrayProxy(v) : v instanceof OplTuple ? this.tupleProxy(v) : this.setObject(v);
+        this.wrappers.set(v, w);
+      }
+      return w;
+    }
     if (v instanceof ConstraintRef) {
-      return { [OPL]: v, name: v.name, get dual() { return v.dual; }, get slack() { return v.slack; }, get value() { return v.activity; } };
+      const m = this.model;
+      const rt = this;
+      return {
+        [OPL]: v,
+        name: v.name,
+        get dual() { return v.dual; },
+        get slack() { return v.slack; },
+        get value() { return v.activity; },
+        get LB() { return m.rowBounds(v).lb; },
+        set LB(x: number) { m.setRowBound(v, 'lb', Number(x)); },
+        get UB() { return m.rowBounds(v).ub; },
+        set UB(x: number) { m.setRowBound(v, 'ub', Number(x)); },
+        setCoef(x: unknown, c: number) { m.setRowCoef(v, rt.varArg(x), Number(c)); },
+        setBounds(lb: number, ub: number) { m.setRowBound(v, 'lb', Number(lb)); m.setRowBound(v, 'ub', Number(ub)); },
+      };
     }
     if (v instanceof Activity) {
       const n = (x: DVar | number) => (typeof x === 'number' ? x : x.value);
@@ -273,6 +311,13 @@ export class IlogRuntime {
   }
 
   private lastVar: DVar | null = null;
+
+  /** A decision variable passed to a script method (ct.setCoef(x, ...)). */
+  varArg(x: unknown): DVar {
+    if (isWrapped(x) && x[OPL] instanceof DVar) return x[OPL] as DVar;
+    if (this.lastVar) return this.lastVar;
+    fail('script: expected a decision variable');
+  }
 
   private installVariableProperties(): void {
     const proto = vm.runInContext('Number.prototype', this.context) as object;
@@ -458,6 +503,7 @@ export class IlogRuntime {
     const methods: Record<string, unknown> = {
       generate: () => m.scriptGenerate(),
       postProcess: () => m.postProcess(),
+      setPoolSolution: (k: number) => m.loadSolution(Number(k)),
       end: () => {},
       addDataSource: (ds: { ast?: DataAst } & Record<string, unknown>) => {
         if (ds?.ast) m.addData(ds.ast);
@@ -594,8 +640,17 @@ export class SolverObject {
     return true;
   }
 
+  /** Fills the solution pool (CPLEX populatelim, default 20). */
   populate(): boolean {
-    return this.solve();
+    const m = this.current();
+    const limit = Number(this.param.populatelim ?? this.param.PopulateLim ?? 20);
+    const n = m.populate(Number.isFinite(limit) && limit > 0 ? limit : 20);
+    this.cursor = n ? 0 : -1;
+    return n > 0;
+  }
+
+  get solnPoolNsolns(): number {
+    return this.model?.solutionCount ?? 0;
   }
   solveFixed(): boolean {
     return this.model?.solved ?? false;
@@ -605,6 +660,9 @@ export class SolverObject {
   setSearchPhases(): void {}
   setStartingPoint(): void {}
   setParam(): void {}
+  setObjCoef(x: unknown, c: number): void {
+    this.current().setObjCoef(this.rt.varArg(x), Number(c));
+  }
   clearModel(): void {}
   printInformation(): void {}
 

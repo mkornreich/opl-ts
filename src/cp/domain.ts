@@ -74,7 +74,7 @@ export class Dom {
 
   withMin(m: number): Dom {
     if (this.size === 0 || m <= this.min) return this;
-    if (this.real) return Dom.range(m, this.max, true);
+    if (this.real) return Dom.range(m > this.max && m - this.max <= realTol(m) ? this.max : m, this.max, true);
     m = Math.ceil(m);
     if (m > this.max) return Dom.EMPTY;
     const iv = this.iv;
@@ -87,7 +87,7 @@ export class Dom {
 
   withMax(m: number): Dom {
     if (this.size === 0 || m >= this.max) return this;
-    if (this.real) return Dom.range(this.min, m, true);
+    if (this.real) return Dom.range(this.min, m < this.min && this.min - m <= realTol(m) ? this.min : m, true);
     m = Math.floor(m);
     if (m < this.min) return Dom.EMPTY;
     const iv = this.iv;
@@ -193,4 +193,9 @@ export class Dom {
     }
     return `{${parts.join(' ')}}`;
   }
+}
+
+/** Rounding noise tolerated when a bound of a real variable crosses the other bound. */
+function realTol(m: number): number {
+  return 1e-9 * Math.max(1, Math.abs(m));
 }

@@ -211,6 +211,15 @@ describe('constraint programming', () => {
     assert.equal(info.objective, 4 + 3);
     assert.equal((m.getField('i')!.value as DVar).value, 4);
   });
+
+  it('keeps fractional and irrational coefficients inside abs and max', () => {
+    const { info } = solve(`
+      {float} r = { sqrt(i) | i in {2, 3, 5} };
+      dvar int y[r] in -10..10;
+      minimize max(i in r) abs(y[i] * i) + abs(1.5 * y[sqrt(5)]);
+      subject to { forall(i in r) y[i] == (i < 1.5 ? 3 : 1); }`, { forceCP: true });
+    assert.ok(Math.abs(info.objective! - (3 * Math.SQRT2 + 1.5)) < 1e-6);
+  });
 });
 
 describe('scheduling', () => {

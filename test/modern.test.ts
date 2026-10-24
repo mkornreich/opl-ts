@@ -190,6 +190,72 @@ describe('IBM ILOG Script', () => {
     `);
     assert.equal(out, '[1 2 3] [1 3 2] [2 3 1] 3\n');
   });
+
+  it('fills the solution pool with cplex.populate()', () => {
+    const { out } = run(`
+      dvar boolean x[1..4];
+      dvar float t;
+      maximize sum(i in 1..4) i * x[i];
+      subject to { sum(i in 1..4) x[i] == 2; t == x[1] + 2 * x[2]; }
+      main {
+        thisOplModel.generate();
+        cplex.populatelim = 10;
+        if (cplex.populate()) {
+          writeln(cplex.solnPoolNsolns);
+          for (var s = 0; s < cplex.solnPoolNsolns; s++) {
+            thisOplModel.setPoolSolution(s);
+            write(thisOplModel.x, " ");
+          }
+          writeln();
+        }
+      }
+    `);
+    const [count, pool] = out.trim().split('\n');
+    assert.equal(count, '6');
+    // The optimum first, then the other ways to pick two of the four.
+    assert.equal(pool.trim().split('] ')[0] + ']', '[0 0 1 1]');
+    assert.equal(new Set(pool.trim().split(/(?<=\]) /)).size, 6);
+  });
+});
+
+describe('quadratic programming', () => {
+  it('solves a convex portfolio QP (as HiGHS does)', () => {
+    const { m, info } = solve(`
+      {string} A = {"A", "B", "C", "D"};
+      float ret[A] = [0.10, 0.12, 0.07, 0.03];
+      float cov[A][A] = [[0.10, 0.02, 0.01, 0.00], [0.02, 0.15, 0.03, 0.00], [0.01, 0.03, 0.05, 0.00], [0.00, 0.00, 0.00, 0.01]];
+      dvar float+ x[A];
+      minimize sum(i, j in A) cov[i][j] * x[i] * x[j];
+      subject to { sum(i in A) x[i] == 1; sum(i in A) ret[i] * x[i] >= 0.08; }`);
+    assert.equal(info.solver, 'QP');
+    assert.ok(Math.abs(info.objective - 0.02657279162819337) < 1e-9);
+    assert.ok(Math.abs(values(m.getField('x')!.value).reduce((a, b) => a + b, 0) - 1) < 1e-9);
+  });
+
+  it('fits least squares, maximizes concave objectives and branches on integers', () => {
+    const ls = solve(`
+      float t[1..6] = [0, 1, 2, 3, 4, 5];
+      float y[1..6] = [1.1, 2.9, 5.2, 7.1, 8.8, 11.2];
+      dvar float a; dvar float b;
+      minimize sum(i in 1..6) (a * t[i] + b - y[i])^2;
+      subject to { a <= 10; }`);
+    assert.ok(Math.abs((ls.m.getField('a')!.value as DVar).value - 2.0028571428571) < 1e-9);
+    assert.ok(Math.abs((ls.m.getField('b')!.value as DVar).value - 1.0428571428571) < 1e-9);
+    const concave = solve('dvar float x in 0..10; maximize 4 * x - x^2; subject to { x <= 8; }');
+    assert.ok(Math.abs(concave.info.objective - 4) < 1e-9);
+    const miqp = solve(`
+      dvar int x in -10..10; dvar int y in -10..10; dvar float z in 0..5;
+      minimize (x - 2.6)^2 + (y - 1.3)^2 + (z - 7)^2 + 0.5 * x * y;
+      subject to { x + y >= 1; }`);
+    assert.equal(miqp.info.solver, 'MIQP');
+    assert.ok(Math.abs(miqp.info.objective - 5.45) < 1e-9);
+    assert.deepEqual([(miqp.m.getField('x')!.value as DVar).value, (miqp.m.getField('y')!.value as DVar).value], [2, 1]);
+  });
+
+  it('leaves non-convex objectives to constraint programming', () => {
+    const { info } = solve('dvar float x in -1..2; dvar int k in 0..3; minimize -x * x + k; subject to { x + k >= 1; }');
+    assert.equal(info.solver, 'CP');
+  });
 });
 
 describe('CP Optimizer constraints and linearization', () => {

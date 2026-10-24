@@ -76,7 +76,19 @@ export class OplSet implements IndexSet {
     this.keys.clear();
   }
   indexOf(v: Value): number {
-    return this.keys.get(keyOf(v)) ?? -1;
+    const i = this.keys.get(keyOf(v));
+    if (i !== undefined) return i;
+    // A tuple of key values selects the element with those keys: <o,d> in S, x[<o,d>].
+    const t = this.elemType;
+    if (v instanceof OplTuple && t?.k === 'struct' && t.s.keyFields.length === v.values.length && t.s.keyFields.length < t.s.fields.length) {
+      const found = t.s.byKey.get(t.s.keyOfValues(v.values));
+      if (found) return this.keys.get(keyOf(found)) ?? -1;
+    }
+    if ((typeof v === 'string' || typeof v === 'number') && t?.k === 'struct' && t.s.keyFields.length === 1) {
+      const found = t.s.byKey.get(t.s.keyOfValues([v]));
+      if (found) return this.keys.get(keyOf(found)) ?? -1;
+    }
+    return -1;
   }
   at(i: number): Value {
     return this.elems[i];

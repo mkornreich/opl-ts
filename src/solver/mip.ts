@@ -1,15 +1,22 @@
 /**
  * LP-based branch and bound for mixed-integer programs.
  *
+ * - Every node is re-optimised from its parent's optimal tableau with the dual
+ *   simplex (warm start); nodes reached later rebuild a saved basis.
+ * - Bounds are tightened by propagation over the rows before each LP, and by
+ *   reduced-cost fixing once an incumbent exists.
+ * - A rounding heuristic looks for incumbents at every node.
+ *
  * Node selection follows the CPLEX "nodeSel" parameter used by the OPL Studio
- * tutorial: 0 = depth-first, anything else = best-bound.  Branching is on the
- * most fractional integer column.  Once an optimum is found the integer
- * columns are fixed and the LP is re-solved to report duals and reduced costs
- * (as CPLEX does for MIPs).
+ * tutorial: 0 = depth-first, otherwise best-bound, diving into one child of
+ * each node.  Once an optimum is found the integer columns are fixed and the
+ * LP is re-solved to report duals and reduced costs (as CPLEX does for MIPs).
  */
 
+import type { SimplexStatus, Snapshot } from './dense.js';
 import { type LinearProgram, type MIPResult } from './lp.js';
-import { solveLP } from './simplex.js';
+import { memoryExceeded } from './memory.js';
+import { createSimplex, solveLP } from './simplex.js';
 
 const INT_TOL = 1e-6;
 
@@ -23,12 +30,20 @@ export interface MIPOptions {
   relativeGap?: number;
 }
 
+/** A node stores its own bound changes on top of its parent's (bounds are rebuilt when it is processed). */
 interface Node {
-  lower: Float64Array;
-  upper: Float64Array;
+  up: Node | null;
+  /** [column, lower, upper] triples. */
+  changes: number[];
   bound: number;
   seq: number;
+  /** Id of the LP state the node starts from, and that state's basis (null: solve from scratch). */
+  parent: number;
+  snap: Snapshot | null;
 }
+
+/** Above this many open nodes, children keep no basis (memory). */
+const MAX_SNAPSHOTS = 2000;
 
 export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult {
   const n = lp.numVars;
@@ -42,8 +57,9 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
     rootUpper[j] = Math.floor(rootUpper[j] + INT_TOL);
   }
 
+  const deadline = options.timeLimit ? performance.now() + options.timeLimit * 1000 : Infinity;
   if (ints.length === 0) {
-    const r = solveLP(lp, rootLower, rootUpper);
+    const r = solveLP(lp, rootLower, rootUpper, { deadline });
     return {
       status: r.status === 'iteration_limit' ? 'limit' : r.status,
       objective: r.objective,
@@ -65,9 +81,9 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
   }
 
   const depthFirst = (options.nodeSelection ?? 1) === 0;
-  const maxNodes = options.maxNodes ?? 1_000_000;
-  const deadline = options.timeLimit ? performance.now() + options.timeLimit * 1000 : Infinity;
+  const maxNodes = options.maxNodes ?? 10_000_000;
   const relGap = options.relativeGap ?? 1e-9;
+  const prop = new BoundPropagator(lp);
 
   let incumbent = Infinity;
   let bestX: Float64Array | null = null;
@@ -83,80 +99,260 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
     return incumbent - Math.max(1e-9, relGap * Math.abs(incumbent));
   };
 
-  const open = new NodeQueue(depthFirst);
-  open.push({ lower: rootLower, upper: rootUpper, bound: -Infinity, seq: seq++ });
+  const objectiveOf = (x: Float64Array): number => {
+    let v = lp.objConstant;
+    for (let j = 0; j < n; j++) v += lp.objective[j] * x[j];
+    return v;
+  };
 
-  while (open.size > 0) {
-    if (nodes >= maxNodes || performance.now() > deadline) {
+  /** Rounds the integer columns of an LP solution; keeps it when feasible and better. */
+  const tryRounding = (xs: Float64Array) => {
+    const x = Float64Array.from(xs.subarray(0, n));
+    for (const j of ints) x[j] = Math.round(x[j]) + 0;
+    for (let j = 0; j < n; j++) if (x[j] < lp.lower[j] - 1e-9 || x[j] > lp.upper[j] + 1e-9) return;
+    for (const row of lp.rows) {
+      let a = 0;
+      for (let k = 0; k < row.index.length; k++) a += row.value[k] * x[row.index[k]];
+      if (a < row.lower - 1e-7 * Math.max(1, Math.abs(row.lower)) || a > row.upper + 1e-7 * Math.max(1, Math.abs(row.upper))) return;
+    }
+    const v = objectiveOf(x);
+    if (v < incumbent - 1e-9) {
+      incumbent = v;
+      bestX = x;
+    }
+  };
+
+  if (!prop.run(rootLower, rootUpper, 50)) {
+    return finish(lp, 'infeasible', Infinity, -Infinity, null, iterations, 0, deadline);
+  }
+
+  let S = createSimplex(lp, rootLower, rootUpper);
+  S.deadline = deadline;
+  let stateId = -1;
+  let nextState = 0;
+  let solvesSinceRefresh = 0;
+
+  /** Solves the node's LP; returns the status (S then holds the node's optimum). */
+  const solveNode = (node: Node): SimplexStatus => {
+    let status: SimplexStatus | null = null;
+    if (stateId >= 0 && (node.parent === stateId || (node.snap && S.restore(node.snap)))) {
+      for (let j = 0; j < n; j++) {
+        if (S.lb[j] !== lower[j] || S.ub[j] !== upper[j]) S.setBounds(j, lower[j], upper[j]);
+      }
+      status = S.dual();
+      if (++solvesSinceRefresh > 200 && status === 'optimal') {
+        // Rebuild the tableau from the original rows now and then (numerical drift).
+        solvesSinceRefresh = 0;
+        if (!S.restore(S.snapshot())) status = null;
+      }
+    }
+    if (status === null || (status === 'iteration_limit' && !S.timedOut)) {
+      iterations += S.iterations;
+      S = createSimplex(lp, lower, upper);
+      S.deadline = deadline;
+      status = S.solve();
+    }
+    stateId = nextState++;
+    return status;
+  };
+
+  const open = new NodeQueue(depthFirst);
+  let current: Node | null = { up: null, changes: [], bound: -Infinity, seq: seq++, parent: -1, snap: null };
+  const lower = new Float64Array(n);
+  const upper = new Float64Array(n);
+  /** The node's bounds before propagation (children store their differences to these). */
+  const baseLower = new Float64Array(n);
+  const baseUpper = new Float64Array(n);
+  const chain: Node[] = [];
+  /** The node's bounds into lower / upper. */
+  const boundsOf = (node: Node) => {
+    lower.set(rootLower);
+    upper.set(rootUpper);
+    chain.length = 0;
+    for (let x: Node | null = node; x; x = x.up) chain.push(x);
+    for (let k = chain.length - 1; k >= 0; k--) {
+      const c = chain[k].changes;
+      for (let i = 0; i < c.length; i += 3) {
+        lower[c[i]] = c[i + 1];
+        upper[c[i]] = c[i + 2];
+      }
+    }
+  };
+
+  while (current || open.size > 0) {
+    if (nodes >= maxNodes || performance.now() > deadline || ((nodes & 63) === 63 && memoryExceeded())) {
       hitLimit = true;
+      if (current) open.push(current);
       break;
     }
-    const node = open.pop();
+    const node: Node = current ?? open.pop();
+    current = null;
     if (node.bound >= cutoff()) continue;
-    const r = solveLP(lp, node.lower, node.upper);
+    boundsOf(node);
+    baseLower.set(lower);
+    baseUpper.set(upper);
+    if (!prop.run(lower, upper, 8)) continue;
+    const st = solveNode(node);
     nodes++;
-    iterations += r.iterations;
-    if (r.status === 'infeasible') continue;
-    if (r.status === 'unbounded') {
+    if (st === 'infeasible') continue;
+    if (st === 'unbounded') {
       unbounded = true;
       break;
     }
-    if (r.status !== 'optimal') {
+    if (st !== 'optimal') {
       hitLimit = true;
       continue;
     }
-    if (r.objective >= cutoff()) continue;
+    const obj = S.objective();
+    if (obj >= cutoff()) continue;
+    tryRounding(S.x);
+    if (obj >= cutoff()) continue;
 
     let branch = -1;
     let bestFrac = 0;
     for (const j of ints) {
-      const v = r.x[j];
+      const v = S.x[j];
       const f = v - Math.floor(v);
       const dist = Math.min(f, 1 - f);
-      if (dist > INT_TOL && dist > bestFrac) {
+      if (dist > INT_TOL && dist > bestFrac + 1e-12) {
         bestFrac = dist;
         branch = j;
       }
     }
     if (branch < 0) {
-      incumbent = r.objective;
-      bestX = Float64Array.from(r.x);
-      for (const j of ints) bestX[j] = Math.round(bestX[j]);
+      const x = Float64Array.from(S.x.subarray(0, n));
+      for (const j of ints) x[j] = Math.round(x[j]) + 0;
+      const v = objectiveOf(x);
+      if (v < incumbent) {
+        incumbent = v;
+        bestX = x;
+      }
       continue;
     }
 
-    const v = r.x[branch];
-    const down: Node = {
-      lower: node.lower,
-      upper: Float64Array.from(node.upper),
-      bound: r.objective,
-      seq: 0,
-    };
-    down.upper[branch] = Math.floor(v);
-    const up: Node = {
-      lower: Float64Array.from(node.lower),
-      upper: node.upper,
-      bound: r.objective,
-      seq: 0,
-    };
-    up.lower[branch] = Math.ceil(v);
-    // The child pushed last is explored first by depth-first search.
+    // Children: propagated bounds, reduced-cost fixing against the incumbent, the branching bound.
+    const common: number[] = [];
+    const room = isFinite(incumbent) ? cutoff() - obj : Infinity;
+    for (let j = 0; j < n; j++) {
+      let lo = lower[j];
+      let hi = upper[j];
+      if (lp.integer[j] && lo !== hi && isFinite(room)) {
+        const dj = S.d[j];
+        if (dj > 1e-9 && S.x[j] <= lo + 1e-9) hi = Math.min(hi, lo + Math.floor(room / dj + 1e-9));
+        else if (dj < -1e-9 && S.x[j] >= hi - 1e-9) lo = Math.max(lo, hi - Math.floor(room / -dj + 1e-9));
+      }
+      if (j === branch) continue;
+      // Store only what differs from the node's own (rebuilt) bounds.
+      if (lo !== baseLower[j] || hi !== baseUpper[j]) common.push(j, lo, hi);
+    }
+    const v = S.x[branch];
+    const snap = open.size < MAX_SNAPSHOTS ? S.snapshot() : null;
+    const down: Node = { up: node, changes: [...common, branch, lower[branch], Math.floor(v)], bound: obj, seq: 0, parent: stateId, snap };
+    const up: Node = { up: node, changes: [...common, branch, Math.ceil(v), upper[branch]], bound: obj, seq: 0, parent: stateId, snap };
     const upFirst = v - Math.floor(v) >= 0.5;
     const [first, second] = upFirst ? [up, down] : [down, up];
     second.seq = seq++;
     first.seq = seq++;
     open.push(second);
-    open.push(first);
+    // Dive into the preferred child: it starts from the current tableau.
+    current = first;
   }
 
+  iterations += S.iterations;
   if (unbounded && !bestX) {
-    return finish(lp, 'unbounded', -Infinity, -Infinity, null, iterations, nodes);
+    return finish(lp, 'unbounded', -Infinity, -Infinity, null, iterations, nodes, deadline);
   }
   if (!bestX) {
-    return finish(lp, hitLimit ? 'limit' : 'infeasible', Infinity, -Infinity, null, iterations, nodes);
+    return finish(lp, hitLimit ? 'limit' : 'infeasible', Infinity, -Infinity, null, iterations, nodes, deadline);
   }
   const bound = hitLimit ? Math.min(incumbent, open.minBound()) : incumbent;
-  return finish(lp, hitLimit ? 'feasible' : 'optimal', incumbent, bound, bestX, iterations, nodes);
+  return finish(lp, hitLimit ? 'feasible' : 'optimal', incumbent, bound, bestX, iterations, nodes, deadline);
+}
+
+/** Tightens column bounds from the row activities (in place); false when infeasible. */
+export class BoundPropagator {
+  private readonly isInt: Uint8Array;
+  constructor(private readonly lp: LinearProgram) {
+    this.isInt = lp.integer;
+  }
+
+  run(lo: Float64Array, hi: Float64Array, maxPasses: number): boolean {
+    const { lp, isInt } = this;
+    for (let j = 0; j < lp.numVars; j++) if (lo[j] > hi[j] + 1e-9) return false;
+    for (let pass = 0; pass < maxPasses; pass++) {
+      let changed = false;
+      for (const row of lp.rows) {
+        const { index, value } = row;
+        let minA = 0;
+        let maxA = 0;
+        let minInf = 0;
+        let maxInf = 0;
+        for (let k = 0; k < index.length; k++) {
+          const a = value[k];
+          const j = index[k];
+          if (a > 0) {
+            if (isFinite(lo[j])) minA += a * lo[j];
+            else minInf++;
+            if (isFinite(hi[j])) maxA += a * hi[j];
+            else maxInf++;
+          } else {
+            if (isFinite(hi[j])) minA += a * hi[j];
+            else minInf++;
+            if (isFinite(lo[j])) maxA += a * lo[j];
+            else maxInf++;
+          }
+        }
+        const tolU = 1e-7 * Math.max(1, Math.abs(row.upper));
+        const tolL = 1e-7 * Math.max(1, Math.abs(row.lower));
+        if (minInf === 0 && minA > row.upper + tolU) return false;
+        if (maxInf === 0 && maxA < row.lower - tolL) return false;
+        if (minInf > 1 && maxInf > 1) continue;
+        for (let k = 0; k < index.length; k++) {
+          const a = value[k];
+          const j = index[k];
+          // Contributions of x_j to the minimum and maximum activity.
+          const cMin = a > 0 ? (isFinite(lo[j]) ? a * lo[j] : null) : isFinite(hi[j]) ? a * hi[j] : null;
+          const cMax = a > 0 ? (isFinite(hi[j]) ? a * hi[j] : null) : isFinite(lo[j]) ? a * lo[j] : null;
+          let newLo = lo[j];
+          let newHi = hi[j];
+          if (isFinite(row.upper)) {
+            const rest = cMin === null ? (minInf === 1 ? minA : NaN) : minInf === 0 ? minA - cMin : NaN;
+            if (!Number.isNaN(rest)) {
+              const b = (row.upper - rest) / a;
+              if (a > 0) newHi = Math.min(newHi, b);
+              else newLo = Math.max(newLo, b);
+            }
+          }
+          if (isFinite(row.lower)) {
+            const rest = cMax === null ? (maxInf === 1 ? maxA : NaN) : maxInf === 0 ? maxA - cMax : NaN;
+            if (!Number.isNaN(rest)) {
+              const b = (row.lower - rest) / a;
+              if (a > 0) newLo = Math.max(newLo, b);
+              else newHi = Math.min(newHi, b);
+            }
+          }
+          if (isInt[j]) {
+            newLo = Math.ceil(newLo - 1e-6);
+            newHi = Math.floor(newHi + 1e-6);
+          }
+          const width = hi[j] - lo[j];
+          const minStep = isInt[j] ? 0.5 : 1e-6 * (isFinite(width) ? Math.max(1, width) : 1);
+          if (newLo > lo[j] + minStep) {
+            lo[j] = newLo;
+            changed = true;
+          }
+          if (newHi < hi[j] - minStep) {
+            hi[j] = newHi;
+            changed = true;
+          }
+          if (lo[j] > hi[j] + 1e-7 * Math.max(1, Math.abs(lo[j]))) return false;
+          if (lo[j] > hi[j]) hi[j] = lo[j];
+        }
+      }
+      if (!changed) break;
+    }
+    return true;
+  }
 }
 
 function finish(
@@ -167,6 +363,7 @@ function finish(
   x: Float64Array | null,
   iterations: number,
   nodes: number,
+  deadline: number,
 ): MIPResult {
   const n = lp.numVars;
   let duals: Float64Array = new Float64Array(lp.rows.length);
@@ -178,7 +375,8 @@ function finish(
     for (let j = 0; j < n; j++) {
       if (lp.integer[j]) lower[j] = upper[j] = x[j];
     }
-    const fixed = solveLP(lp, lower, upper);
+    // A short grace period past the deadline: without it the duals are lost.
+    const fixed = solveLP(lp, lower, upper, { deadline: Math.max(deadline, performance.now() + 2000) });
     iterations += fixed.iterations;
     if (fixed.status === 'optimal') {
       duals = fixed.duals;
@@ -186,16 +384,7 @@ function finish(
       for (let j = 0; j < n; j++) if (!lp.integer[j]) x[j] = fixed.x[j];
     }
   }
-  return {
-    status,
-    objective,
-    bound,
-    x: x ?? new Float64Array(n),
-    duals,
-    reducedCosts,
-    iterations,
-    nodes,
-  };
+  return { status, objective, bound, x: x ?? new Float64Array(n), duals, reducedCosts, iterations, nodes };
 }
 
 /** Stack for depth-first search, binary heap on the bound for best-bound search. */
