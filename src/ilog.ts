@@ -131,7 +131,18 @@ export class IlogRuntime {
         const f = rt.resolve(file);
         this.ast = parseData(fs.readFileSync(f, 'utf8'), f);
       },
-      IloOplDataElements: function () {},
+      // Data elements set on it (`data.n = 5`) override a model's data in addDataSource.
+      IloOplDataElements: function () {
+        const overrides = new Map<string, Value>();
+        return new Proxy({} as Record<string | symbol, unknown>, {
+          get: (_, p) => (p === OPL ? overrides : typeof p === 'string' && overrides.has(p) ? rt.toJS(overrides.get(p)!) : undefined),
+          set: (_, p, v) => {
+            if (typeof p === 'string') overrides.set(p, rt.fromJS(v));
+            return true;
+          },
+          has: (_, p) => p === OPL || (typeof p === 'string' && overrides.has(p)),
+        });
+      },
       IloOplSettings: function () {},
       IloOplErrorHandler: function () {},
       IloCplex: function (this: object) {

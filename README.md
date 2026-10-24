@@ -11,6 +11,8 @@ It covers both dialects: OPL 3.x (`var`, `solve`, `search`, OPLScript `.osc`, `A
 It runs the material from the OPL Studio tutorial of MIT OpenCourseWare
 [1.206J Airline Schedule Planning (Spring 2003), Study Materials](https://ocw.mit.edu/courses/1-206j-airline-schedule-planning-spring-2003/pages/study-materials/), and it was checked against OPL models published on GitHub (see [Verification](#verification)).
 
+**Playground**: [mkornreich.github.io/opl-ts](https://mkornreich.github.io/opl-ts/) runs the examples in `web/examples/` (and the OPL Studio tutorial projects) in the browser: edit a model, solve it, and see the output, a chart of the solution or a Gantt chart of a schedule. `npm run build:web` builds it into `site/`; the Pages workflow publishes it on every push to `development`.
+
 ## Quick start
 
 ```bash

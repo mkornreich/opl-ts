@@ -1427,6 +1427,37 @@ export class ModelInstance implements HostObject {
     fail(`cannot write a ${typeName(v)}`);
   }
 
+  /**
+   * The current solution for display: declared decision variables and the
+   * scheduled activities, with the resources each one uses.
+   */
+  solutionSummary(): {
+    variables: { name: string; value: number; isInt: boolean }[];
+    activities: { name: string; start: number; end: number; resources: string[] }[];
+  } {
+    const variables = this.decision.filter((v) => !v.aux).map((v) => ({ name: v.name, value: v.value, isInt: v.isInt }));
+    const uses = new Map<Activity, string[]>();
+    const walk = (c: unknown): void => {
+      if (!c || typeof c !== 'object') return;
+      if (Array.isArray(c)) return c.forEach(walk);
+      const o = c as Record<string, unknown>;
+      if (o.k === 'uses' && o.act instanceof Activity && o.res instanceof Resource) {
+        // Alternative resources: only the selected one.
+        if (o.presence instanceof DVar && o.presence.value !== 1) return;
+        const list = uses.get(o.act) ?? [];
+        if (!list.includes(o.res.name)) list.push(o.res.name);
+        uses.set(o.act, list);
+        return;
+      }
+      if (typeof o.k === 'string') for (const v of Object.values(o)) if (v && typeof v === 'object' && !(v instanceof DVar) && !(v instanceof LinExpr)) walk(v);
+    };
+    walk(this.cpCons);
+    const activities = this.activities
+      .filter((a) => !a.presence || a.presence.value === 1)
+      .map((a) => ({ name: a.name, start: a.start.value, end: a.end.value, resources: uses.get(a) ?? [] }));
+    return { variables, activities };
+  }
+
   // ------------------------------------------------------------ HostObject (OPLScript access)
 
   getField(name: string): Binding | undefined {

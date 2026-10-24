@@ -124,6 +124,8 @@ export class Evaluator {
   private readonly expanded = new WeakMap<Quantifier, Binder[]>();
   /** Model generation or live search: creates auxiliary variables for CP expressions. */
   cp: CPHooks | null = null;
+  /** noOverlap constraints so far (their resources are numbered). */
+  private noOverlaps = 0;
   /** Selection variables of activities on alternative resources (for post-solve queries). */
   selections: Map<Activity, Map<Resource, DVar[]>> | null = null;
   /** Search-time queries such as isRanked(r) (set by the search engine). */
@@ -990,7 +992,7 @@ export class Evaluator {
         return this.ifPresent(args, this.temporal('start', 'end', args, pos, '=', undefined, true), pos);
       case 'noOverlap': {
         const acts = this.leaves(args[0]).map((a) => this.activityArg(a, pos));
-        const res = new Resource(`noOverlap#${acts.length}`, 'unary', 1, 0);
+        const res = new Resource(`noOverlap#${++this.noOverlaps}`, 'unary', 1, 0);
         return this.usesAll(acts.map((act) => ({ act, height: 1 })), res, pos);
       }
       case 'pulse': {

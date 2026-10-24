@@ -192,9 +192,15 @@ class Search {
     const decision = this.p.decision.map((v) => v.id);
     const selections: number[] = [];
     for (const byAlt of this.p.selections.values()) for (const sel of byAlt.values()) selections.push(...sel.map((v) => v.id));
-    return this.label(decision, true, () =>
-      this.label(selections, false, () =>
-        this.setTimes(this.p.activities, () => this.label([...Array(this.s.numVars).keys()], true, k))));
+    const rest = () => this.label([...Array(this.s.numVars).keys()], true, k);
+    // Scheduling models: choose resources, order the tasks of each unary
+    // resource, set start times earliest first, then the rest.
+    if (this.p.activities.length) {
+      const unary = [...this.b.disjunctives.values()];
+      return this.label(selections, false, () =>
+        this.rank(unary, () => this.setTimes(this.p.activities, () => this.label(decision, true, rest))));
+    }
+    return this.label(decision, true, () => this.label(selections, false, rest));
   }
 
   private solution(): boolean {
@@ -205,6 +211,16 @@ class Search {
     if (this.limitHit) return true;
     if ((this.s.choicePoints & 255) === 0 && (performance.now() > this.deadline || memoryExceeded())) this.limitHit = true;
     return this.limitHit;
+  }
+
+  /**
+   * After backtracking, the objective bound may be better than when this
+   * state was propagated: propagate again.  False when the state is dead.
+   */
+  private reapplyBound(): boolean {
+    const s = this.s;
+    if (s.objVar < 0 || s.max(s.objVar) <= s.objBound) return true;
+    return s.propagate();
   }
 
   /** Tries alternatives 0..n-1 in order (an OR node). */
@@ -236,6 +252,9 @@ class Search {
     let i = 0;
     for (const val of values) {
       if (this.timeUp()) return true;
+      if (i > 0 && !this.reapplyBound()) return false;
+      if (val > s.max(v)) break;
+      if (!s.dom(v).contains(val)) continue;
       if (i > 0 && this.discrepancies >= this.discrepancyLimit) return false;
       const mark = s.mark();
       const saved = this.discrepancies;
@@ -280,11 +299,13 @@ class Search {
     /** Applies the frame's next alternative; false when none is left (or the search stops). */
     const advance = (f: Frame): boolean => {
       for (;;) {
+        if (f.i > 0 && !this.reapplyBound()) return false;
         let val = 0;
         if (f.values) {
           const r = f.values.next();
-          if (r.done) return false;
+          if (r.done || r.value > s.max(f.v)) return false;
           val = r.value;
+          if (!s.dom(f.v).contains(val)) continue;
         } else if (f.i >= 2) return false;
         if (this.timeUp()) {
           stop = true;

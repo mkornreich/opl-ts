@@ -298,6 +298,15 @@ describe('scheduling', () => {
   });
 });
 
+describe('CP Optimizer scheduling', () => {
+  it('proves the ft06 job shop optimum (55) with interval variables', () => {
+    const src = fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'web', 'examples', 'jobshop.mod'), 'utf8');
+    const { info } = solve(src, { timeLimit: 30 });
+    assert.equal(info.status, 'optimal');
+    assert.equal(info.objective, 55);
+  });
+});
+
 describe('OPLScript and databases', () => {
   it('enumerates solutions with nextSolution()', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opl-cp-'));

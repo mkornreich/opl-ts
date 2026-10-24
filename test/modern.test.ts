@@ -191,6 +191,27 @@ describe('IBM ILOG Script', () => {
     assert.equal(out, '[1 2 3] [1 3 2] [2 3 1] 3\n');
   });
 
+  it('overrides data with IloOplDataElements in a main block', () => {
+    const { out } = run(`
+      float k = ...;
+      dvar float+ x;
+      minimize x;
+      subject to { x >= k; }
+      main {
+        for (var t = 1; t <= 3; t++) {
+          var data = new IloOplDataElements();
+          data.k = 2 * t;
+          var m = new IloOplModel(thisOplModel.modelDefinition, cplex);
+          m.addDataSource(data);
+          m.generate();
+          if (cplex.solve()) write(cplex.getObjValue(), " ");
+          m.end();
+        }
+      }
+    `);
+    assert.equal(out.trim(), '2 4 6');
+  });
+
   it('fills the solution pool with cplex.populate()', () => {
     const { out } = run(`
       dvar boolean x[1..4];

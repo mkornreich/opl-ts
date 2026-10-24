@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>opl-ts playground</title>
+  <meta name="description" content="OPL, the Optimization Programming Language, in TypeScript with its own LP, MIP, QP and constraint-programming solvers. Edit and solve OPL models in the browser.">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>opl-ts</h1>
+      <p>OPL, the Optimization Programming Language of ILOG OPL Studio and IBM CPLEX Optimization Studio, implemented in TypeScript with its own LP / MIP, QP and constraint-programming solvers. Every example below runs in your browser.</p>
+    </div>
+    <a class="repo" href="https://github.com/mkornreich/opl-ts">Source on GitHub</a>
+  </header>
+
+  <section class="kpis" aria-label="Verification">
+    <div class="tile">
+      <span class="tile-value" id="kpi-corpus">–</span>
+      <span class="tile-label">OPL models from GitHub that run</span>
+      <span class="tile-note" id="kpi-corpus-note"></span>
+    </div>
+    <div class="tile">
+      <span class="tile-value" id="kpi-highs">–</span>
+      <span class="tile-label">LP / MIP optima equal to HiGHS</span>
+      <span class="tile-note">every corpus model with an objective to compare</span>
+    </div>
+    <div class="tile">
+      <span class="tile-value" id="kpi-fuzz">–</span>
+      <span class="tile-label">random problems cross-checked</span>
+      <span class="tile-note" id="kpi-fuzz-note"></span>
+    </div>
+    <div class="tile">
+      <span class="tile-value" id="kpi-tests">–</span>
+      <span class="tile-label">tests passing</span>
+      <span class="tile-note" id="kpi-tests-note"></span>
+    </div>
+  </section>
+
+  <section class="corpus panel" aria-labelledby="corpus-title">
+    <h2 id="corpus-title">How the GitHub corpus runs</h2>
+    <p class="muted" id="corpus-caption"></p>
+    <div id="corpus-chart" class="chart"></div>
+  </section>
+
+  <main class="playground">
+    <nav class="examples panel" aria-label="Examples">
+      <h2>Examples</h2>
+      <div id="example-list"></div>
+    </nav>
+
+    <section class="editor panel" aria-labelledby="example-title">
+      <div class="example-head">
+        <h2 id="example-title">Loading…</h2>
+        <span class="badge" id="example-source" hidden></span>
+      </div>
+      <p class="muted" id="example-summary"></p>
+      <div class="file-tabs" role="tablist" aria-label="Files" id="file-tabs"></div>
+      <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Model source"></textarea>
+      <div class="toolbar">
+        <button type="button" class="primary" id="solve">Solve</button>
+        <label>Time limit
+          <select id="time-limit">
+            <option value="5">5 s</option>
+            <option value="10" selected>10 s</option>
+            <option value="30">30 s</option>
+            <option value="60">60 s</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="force-cp"> Constraint programming</label>
+        <button type="button" id="reset">Reset files</button>
+      </div>
+    </section>
+
+    <section class="results panel" aria-labelledby="results-title" aria-live="polite">
+      <h2 id="results-title">Result</h2>
+      <div class="status" id="status"><span class="muted">Press Solve to run the model.</span></div>
+      <div class="result-tabs" role="tablist" aria-label="Result views" id="result-tabs"></div>
+      <div id="result-views">
+        <pre id="view-output" class="view" role="tabpanel"></pre>
+        <div id="view-chart" class="view chart" role="tabpanel" hidden></div>
+        <div id="view-schedule" class="view chart" role="tabpanel" hidden></div>
+        <div id="view-table" class="view" role="tabpanel" hidden></div>
+        <div id="view-files" class="view" role="tabpanel" hidden></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot muted">
+    <p>Solves run in a web worker with the same code as the command-line tool (<code>node dist/src/cli.js model.mod</code>). Spreadsheets, databases and <code>IloOplExec</code> need the command line. The tutorial files come from MIT OpenCourseWare <a href="https://ocw.mit.edu/courses/1-206j-airline-schedule-planning-spring-2003/pages/study-materials/">1.206J Airline Schedule Planning</a>.</p>
+  </footer>
+  <div class="tooltip" id="tooltip" role="status" hidden></div>
+</body>
+</html>
