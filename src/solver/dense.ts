@@ -19,7 +19,7 @@ import { reserve } from './memory.js';
 
 export const FEAS_TOL = 1e-9;
 const OPT_TOL = 1e-9;
-const PIVOT_TOL = 1e-10;
+const PIVOT_TOL = 1e-7;
 /** Consecutive degenerate pivots before switching to Bland's rule. */
 const DEGENERATE_LIMIT = 50;
 
@@ -297,6 +297,7 @@ export class DenseSimplex {
 
   /** Two-phase primal simplex from the starting basis. */
   solve(maxIterations = 1000 + 50 * (this.m + this.N)): SimplexStatus {
+    this.unstable = false;
     if (this.trivial) return 'infeasible';
     const { n, m, N, x, ub, isBasic } = this;
     if (N > n + m) {
@@ -313,8 +314,38 @@ export class DenseSimplex {
       }
     }
     const st = this.primal(this.cost, maxIterations);
-    if (st === 'optimal') this.recomputeBasics();
+    if (st === 'optimal') {
+      this.recomputeBasics();
+      this.checkSolution();
+    }
     return st;
+  }
+
+  /**
+   * Set when an optimal tableau no longer matches the original rows (pivots on
+   * nearly dependent rows lose accuracy); callers then solve again with the
+   * sparse simplex, which refactorises.
+   */
+  unstable = false;
+
+  private checkSolution(): void {
+    const { lp, x, n } = this;
+    for (let j = 0; j < n; j++) {
+      const t = 1e-6 * Math.max(1, Math.abs(x[j]));
+      if (x[j] < this.lb[j] - t || x[j] > this.ub[j] + t) {
+        this.unstable = true;
+        return;
+      }
+    }
+    for (const row of lp.rows) {
+      let a = 0;
+      for (let k = 0; k < row.index.length; k++) a += row.value[k] * x[row.index[k]];
+      const t = 1e-6 * Math.max(1, Math.abs(a));
+      if (a < row.lower - t || a > row.upper + t) {
+        this.unstable = true;
+        return;
+      }
+    }
   }
 
   // ------------------------------------------------------------ warm starts
@@ -346,6 +377,7 @@ export class DenseSimplex {
    * feasible basis.  Returns null when the basis is not dual feasible.
    */
   dual(maxIterations = this.iterations + 1000 + 20 * (this.m + this.N)): SimplexStatus | null {
+    this.unstable = false;
     const { T, x, lb, ub, d, basis, isBasic, m, N } = this;
     // Dual feasibility of the non-basic columns.
     for (let j = 0; j < N; j++) {
@@ -374,6 +406,7 @@ export class DenseSimplex {
       }
       if (r < 0) {
         this.recomputeBasics();
+        this.checkSolution();
         return 'optimal';
       }
       const b = basis[r];
@@ -507,6 +540,84 @@ export class DenseSimplex {
       for (let j = 0; j < N; j++) if (t[j] !== 0 && !isBasic[j]) v -= t[j] * x[j];
       x[basis[i]] = v;
     }
+  }
+
+  /**
+   * Gomory mixed-integer cuts from the rows of the optimal tableau whose basic
+   * integer column is fractional (colInt: integer columns, logicals included),
+   * as rows  sum(c x) >= rhs  over the structural columns.
+   */
+  gomoryCuts(colInt: Uint8Array, maxCuts: number): import('./lp.js').Row[] {
+    const { T, x, lb, ub, basis, isBasic, n, m, N, lp } = this;
+    const rows: { row: import('./lp.js').Row; score: number }[] = [];
+    for (let r = 0; r < m; r++) {
+      const b = basis[r];
+      if (b >= n + m || !colInt[b]) continue;
+      const beta = x[b];
+      const f0 = beta - Math.floor(beta);
+      if (f0 < 0.01 || f0 > 0.99) continue;
+      // x_b + sum(a_j y_j) = beta with y_j >= 0 the distance of x_j from its bound.
+      const coef = new Float64Array(n);
+      let rhs = 1;
+      let ok = true;
+      const t = T[r];
+      for (let j = 0; j < N && ok; j++) {
+        if (isBasic[j] || t[j] === 0) continue;
+        if (ub[j] - lb[j] <= FEAS_TOL) continue;
+        const atLb = Math.abs(x[j] - lb[j]) <= FEAS_TOL && isFinite(lb[j]);
+        const atUb = !atLb && Math.abs(x[j] - ub[j]) <= FEAS_TOL && isFinite(ub[j]);
+        if (!atLb && !atUb) {
+          ok = false;
+          break;
+        }
+        const a = atLb ? t[j] : -t[j];
+        const bound = atLb ? lb[j] : ub[j];
+        const integral = colInt[j] && Number.isInteger(bound);
+        let g: number;
+        if (integral) {
+          const fj = a - Math.floor(a);
+          g = fj <= f0 ? fj / f0 : (1 - fj) / (1 - f0);
+        } else g = a >= 0 ? a / f0 : -a / (1 - f0);
+        if (g === 0) continue;
+        // g y_j with y_j = x_j - lb (at lb) or ub - x_j (at ub); logicals expand to their rows.
+        const sign = atLb ? 1 : -1;
+        rhs += sign * g * bound;
+        if (j < n) coef[j] += sign * g;
+        else if (j < n + m) {
+          const row = lp.rows[j - n];
+          for (let k = 0; k < row.index.length; k++) coef[row.index[k]] += sign * g * row.value[k];
+        } else ok = false;
+      }
+      if (!ok) continue;
+      let big = 0;
+      let small = Infinity;
+      for (let j = 0; j < n; j++) {
+        const v = Math.abs(coef[j]);
+        if (v < 1e-11) coef[j] = 0;
+        else {
+          big = Math.max(big, v);
+          small = Math.min(small, v);
+        }
+      }
+      if (big === 0 || big / small > 1e6) continue;
+      // Violation at the current point, relative to the cut's size.
+      let lhs = 0;
+      const index: number[] = [];
+      const value: number[] = [];
+      for (let j = 0; j < n; j++) {
+        if (coef[j] === 0) continue;
+        index.push(j);
+        value.push(coef[j] / big);
+        lhs += coef[j] * x[j];
+      }
+      const viol = (rhs - lhs) / big;
+      if (viol < 1e-6) continue;
+      // A little slack against rounding in the tableau.
+      const lower = rhs / big - 1e-9 * Math.max(1, Math.abs(rhs / big));
+      rows.push({ row: { index, value, lower, upper: Infinity }, score: viol });
+    }
+    rows.sort((a, b) => b.score - a.score);
+    return rows.slice(0, maxCuts).map((r) => r.row);
   }
 
   objective(): number {

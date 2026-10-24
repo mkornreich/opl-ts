@@ -143,6 +143,154 @@ function luSolve(a: Float64Array[], b: Float64Array): boolean {
 
 type Side = 'L' | 'U' | 'E';
 
+/** Inverse of a dense symmetric matrix by Gauss-Jordan elimination with partial pivoting (null when singular). */
+function invert(a: Float64Array[]): Float64Array[] | null {
+  const s = a.length;
+  const m = a.map((r) => Float64Array.from(r));
+  const inv = Array.from({ length: s }, (_, i) => {
+    const r = new Float64Array(s);
+    r[i] = 1;
+    return r;
+  });
+  let scale = 0;
+  for (const r of m) for (let j = 0; j < s; j++) scale = Math.max(scale, Math.abs(r[j]));
+  const tol = 1e-12 * Math.max(1, scale);
+  for (let p = 0; p < s; p++) {
+    let best = p;
+    for (let r = p + 1; r < s; r++) if (Math.abs(m[r][p]) > Math.abs(m[best][p])) best = r;
+    if (Math.abs(m[best][p]) <= tol) return null;
+    [m[p], m[best]] = [m[best], m[p]];
+    [inv[p], inv[best]] = [inv[best], inv[p]];
+    const piv = m[p][p];
+    for (let c = 0; c < s; c++) {
+      m[p][c] /= piv;
+      inv[p][c] /= piv;
+    }
+    for (let r = 0; r < s; r++) {
+      if (r === p) continue;
+      const f = m[r][p];
+      if (f === 0) continue;
+      const mr = m[r];
+      const ir = inv[r];
+      const mp = m[p];
+      const ip = inv[p];
+      for (let c = 0; c < s; c++) {
+        mr[c] -= f * mp[c];
+        ir[c] -= f * ip[c];
+      }
+    }
+  }
+  return inv;
+}
+
+/**
+ * The inverse of the KKT matrix of the working set, updated in O(s^2) when
+ * one free column or active row is added (bordering) or removed, and
+ * rebuilt every REBUILD updates against rounding.
+ */
+class KKTInverse {
+  private updates = 0;
+  private static readonly REBUILD = 40;
+  private constructor(
+    public keys: string[],
+    private B: Float64Array[],
+  ) {}
+
+  static build(keys: string[], entry: (a: string, b: string) => number): KKTInverse | null {
+    const K = keys.map((a) => Float64Array.from(keys, (b) => entry(a, b)));
+    const B = invert(K);
+    return B ? new KKTInverse([...keys], B) : null;
+  }
+
+  /** Brings the inverse to the given keys; false when that is not one simple change or the matrix is singular. */
+  sync(keys: string[], entry: (a: string, b: string) => number): boolean {
+    if (this.updates >= KKTInverse.REBUILD) return false;
+    const have = new Set(this.keys);
+    const want = new Set(keys);
+    const added = keys.filter((k) => !have.has(k));
+    const removed = this.keys.filter((k) => !want.has(k));
+    if (added.length + removed.length > 1) return false;
+    if (removed.length && !this.remove(removed[0])) return false;
+    if (added.length && !this.add(added[0], entry)) return false;
+    return true;
+  }
+
+  private add(key: string, entry: (a: string, b: string) => number): boolean {
+    const { B, keys } = this;
+    const s = keys.length;
+    const u = Float64Array.from(keys, (k) => entry(key, k));
+    const d = entry(key, key);
+    const w = new Float64Array(s);
+    for (let i = 0; i < s; i++) {
+      let v = 0;
+      const r = B[i];
+      for (let j = 0; j < s; j++) v += r[j] * u[j];
+      w[i] = v;
+    }
+    let uw = 0;
+    let uu = 0;
+    for (let i = 0; i < s; i++) {
+      uw += u[i] * w[i];
+      uu += u[i] * u[i];
+    }
+    const sigma = d - uw;
+    if (Math.abs(sigma) <= 1e-9 * Math.max(1, Math.abs(d), Math.abs(uw), uu)) return false;
+    for (let i = 0; i < s; i++) {
+      const r = B[i];
+      const f = w[i] / sigma;
+      for (let j = 0; j < s; j++) r[j] += f * w[j];
+    }
+    const row = new Float64Array(s + 1);
+    for (let i = 0; i < s; i++) row[i] = -w[i] / sigma;
+    row[s] = 1 / sigma;
+    this.B = B.map((r, i) => {
+      const n = new Float64Array(s + 1);
+      n.set(r);
+      n[s] = row[i];
+      return n;
+    });
+    this.B.push(row);
+    keys.push(key);
+    this.updates++;
+    return true;
+  }
+
+  /** False when the smaller matrix is (nearly) singular. */
+  private remove(key: string): boolean {
+    const p = this.keys.indexOf(key);
+    const { B } = this;
+    const beta = B[p][p];
+    let big = 0;
+    for (let j = 0; j < B.length; j++) big = Math.max(big, Math.abs(B[p][j]));
+    if (!(Math.abs(beta) > 1e-9 * big)) return false;
+    const out: Float64Array[] = [];
+    for (let i = 0; i < B.length; i++) {
+      if (i === p) continue;
+      const r = new Float64Array(B.length - 1);
+      const f = B[i][p] / beta;
+      let c = 0;
+      for (let j = 0; j < B.length; j++) if (j !== p) r[c++] = B[i][j] - f * B[p][j];
+      out.push(r);
+    }
+    this.B = out;
+    this.keys.splice(p, 1);
+    this.updates++;
+    return true;
+  }
+
+  solve(rhs: Float64Array): Float64Array {
+    const s = this.keys.length;
+    const out = new Float64Array(s);
+    for (let i = 0; i < s; i++) {
+      let v = 0;
+      const r = this.B[i];
+      for (let j = 0; j < s; j++) v += r[j] * rhs[j];
+      out[i] = v;
+    }
+    return out;
+  }
+}
+
 /** Solves the continuous QP with the given column bounds. */
 export function solveQP(lp: LinearProgram, h: Hessian, lower = lp.lower, upper = lp.upper, options: QPOptions = {}): LPResult {
   return qp(lp, new SymMatrix(lp.numVars, h), lower, upper, options.deadline ?? Infinity);
@@ -184,6 +332,7 @@ function qp(lp: LinearProgram, H: SymMatrix, lower: Float64Array, upper: Float64
   const maxIterations = 1000 + 20 * (n + m);
   let lambda = new Float64Array(0);
   let shift = 0;
+  let kkt: KKTInverse | null = null;
   for (;;) {
     if (++iterations > maxIterations || performance.now() > deadline) return emptyResult(lp, 'iteration_limit', iterations);
     const g = H.times(x);
@@ -220,9 +369,72 @@ function qp(lp: LinearProgram, H: SymMatrix, lower: Float64Array, upper: Float64
       });
       return [K, rhs];
     };
-    let [K, sol] = build(shift);
+    // Unshifted systems go through the updated inverse; it falls back to a full solve.
+    let sol: Float64Array | null = null;
+    if (shift === 0) {
+      const keys = [...free.map((j) => `c${j}`), ...work.map((w) => `r${w.row}`)];
+      const rowCoef = (i: number, j: number) => {
+        const r = lp.rows[i];
+        let v = 0;
+        for (let e = 0; e < r.index.length; e++) if (r.index[e] === j) v += r.value[e];
+        return v;
+      };
+      const entry = (a: string, b: string): number => {
+        const ia = Number(a.slice(1));
+        const ib = Number(b.slice(1));
+        if (a[0] === 'c' && b[0] === 'c') return H.get(ia, ib);
+        if (a[0] === 'r' && b[0] === 'r') return 0;
+        return a[0] === 'r' ? rowCoef(ia, ib) : rowCoef(ib, ia);
+      };
+      if (!kkt || !kkt.sync(keys, entry)) kkt = KKTInverse.build(keys, entry);
+      if (kkt) {
+        const at = new Map(kkt.keys.map((key, t) => [key, t]));
+        const rhs = Float64Array.from(kkt.keys, (key) => (key[0] === 'c' ? -g[Number(key.slice(1))] : 0));
+        const z = kkt.solve(rhs);
+        // Iterative refinement: r = rhs - K z with the sparse K, z += B r.
+        const colAt = new Int32Array(n).fill(-1);
+        const rowAt = new Map<number, number>();
+        kkt.keys.forEach((key, t) => (key[0] === 'c' ? (colAt[Number(key.slice(1))] = t) : rowAt.set(Number(key.slice(1)), t)));
+        let residual = 0;
+        for (let pass = 0; pass < 3; pass++) {
+          const r = Float64Array.from(rhs);
+          kkt.keys.forEach((key, t) => {
+            if (key[0] !== 'c') return;
+            const j = Number(key.slice(1));
+            const hr = H.rows[j];
+            for (let q = 0; q < hr.col.length; q++) {
+              const u = colAt[hr.col[q]];
+              if (u >= 0) r[t] -= hr.val[q] * z[u];
+            }
+          });
+          for (const [i, t] of rowAt) {
+            const row = lp.rows[i];
+            for (let e = 0; e < row.index.length; e++) {
+              const u = colAt[row.index[e]];
+              if (u < 0) continue;
+              r[t] -= row.value[e] * z[u];
+              r[u] -= row.value[e] * z[t];
+            }
+          }
+          residual = 0;
+          for (let t = 0; t < r.length; t++) residual = Math.max(residual, Math.abs(r[t]));
+          if (pass === 2) break;
+          const dz = kkt.solve(r);
+          for (let t = 0; t < z.length; t++) z[t] += dz[t];
+        }
+        let rmax = 1;
+        for (let t = 0; t < rhs.length; t++) rmax = Math.max(rmax, Math.abs(rhs[t]));
+        // A nearly singular system: leave it to the shifted full solve.
+        if (!(residual <= 1e-9 * rmax)) kkt = null;
+        else sol = Float64Array.from(keys, (key) => z[at.get(key)!]);
+      }
+    } else kkt = null;
+    let K: Float64Array[];
     let shifted = shift > 0;
-    if (!luSolve(K, sol)) {
+    if (sol === null) [K, sol] = build(shift);
+    if (sol !== null && !shifted && kkt) {
+      // solved by the inverse
+    } else if (!luSolve(K!, sol)) {
       // No curvature along some free directions: shift the diagonal.
       let scale = 1;
       for (const j of free) scale = Math.max(scale, Math.abs(H.get(j, j)));

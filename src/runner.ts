@@ -138,7 +138,12 @@ export function statsLine(info: SolveInfo): string {
   }
   const ints = info.numIntVars > 0 ? ` (${info.numIntVars} integer)` : '';
   const nodes = info.numIntVars > 0 ? `, ${info.nodes} branch-and-bound nodes` : '';
-  const what = info.solver === 'QP' || info.solver === 'MIQP' ? 'iterations' : 'simplex iterations';
+  // The global solver (quadratic rows, non-convex objectives) counts nodes only.
+  if (info.iterations === 0 && info.nodes > 0 && info.solver !== 'LP' && info.solver !== 'MIP') {
+    return `[${info.solver}: ${info.numVars} variables${ints}, ${info.numConstraints} constraints; ` +
+      `${info.nodes} branch-and-bound nodes; ${info.time.toFixed(3)} s]`;
+  }
+  const what = info.solver === 'LP' || info.solver === 'MIP' ? 'simplex iterations' : 'iterations';
   return `[${info.solver}: ${info.numVars} variables${ints}, ${info.numConstraints} constraints; ` +
     `${info.iterations} ${what}${nodes}; ${info.time.toFixed(3)} s]`;
 }

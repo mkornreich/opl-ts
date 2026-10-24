@@ -16,6 +16,7 @@ import { CPBuilder } from './builder.js';
 import { Linear as LinearProp, ReifLinear } from './propagators.js';
 import { Disjunctive, NotFirst } from './sched.js';
 import { Dom } from './domain.js';
+import { SearchLimit } from './store.js';
 import { memoryExceeded } from '../solver/memory.js';
 import { Activity, CPConstraint, Flattener, Resource, type CPCons, type CPDef, type CPHooks } from './terms.js';
 
@@ -86,10 +87,17 @@ export function solveCP(p: CPProblem, options: CPOptions = {}): CPResult {
     step = f.integral ? 1 : 0;
     s.objVar = objVar;
   }
-  if (!b.ok || !s.propagate()) return finish();
+  const deadline = options.timeLimit ? performance.now() + options.timeLimit * 1000 : Infinity;
+  s.deadline = deadline;
+  try {
+    if (!b.ok || !s.propagate()) return finish();
+  } catch (e) {
+    if (!(e instanceof SearchLimit)) throw e;
+    result.status = 'limit';
+    return finish();
+  }
 
   s.searching = true;
-  const deadline = options.timeLimit ? performance.now() + options.timeLimit * 1000 : Infinity;
   const onSolution = (): boolean => {
     const values = new Float64Array(p.vars.length);
     for (let i = 0; i < p.vars.length; i++) values[i] = s.value(i);
@@ -111,6 +119,9 @@ export function solveCP(p: CPProblem, options: CPOptions = {}): CPResult {
   ev.searchFns = (fn, args, pos) => search.query(fn, args, pos);
   try {
     search.run();
+  } catch (e) {
+    if (!(e instanceof SearchLimit)) throw e;
+    search.limitHit = true;
   } finally {
     ev.phase = savedPhase;
     ev.cp = savedHooks;
@@ -288,11 +299,17 @@ class Search {
       // A float variable is split until it is bound, as before.
       const top = stack[stack.length - 1];
       if (top && top.values === null && !s.isBound(top.v)) return top.v;
+      // dom/wdeg: the smallest domain per unit of constraint weight.
       let best = -1;
+      let bestScore = Infinity;
       for (const v of vars) {
         if (v >= s.numVars || s.isBound(v)) continue;
         if (!firstFail) return v;
-        if (best < 0 || s.size(v) < s.size(best)) best = v;
+        const score = s.size(v) / s.weight(v);
+        if (score < bestScore) {
+          bestScore = score;
+          best = v;
+        }
       }
       return best;
     };

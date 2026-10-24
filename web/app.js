@@ -51,9 +51,11 @@ function renderVerification(v) {
   $('kpi-corpus').textContent = `${ran} / ${runnable}`;
   $('kpi-corpus-note').textContent = `${Math.round((ran / runnable) * 100)}% of the ${runnable} that have their data, from ${c.repositories} repositories`;
   $('kpi-highs').textContent = `${v.highsAgree} / ${v.highsAgree}`;
-  const fuzz = v.mipFuzz + v.qpFuzz.total + v.bruteForce;
+  const fuzz = v.mipFuzz + v.qpFuzz.total + v.bruteForce + (v.globalFuzz ?? 0);
   $('kpi-fuzz').textContent = fuzz.toLocaleString('en-US');
-  $('kpi-fuzz-note').textContent = `${v.mipFuzz.toLocaleString('en-US')} LP/MIP and ${v.qpFuzz.total} QP vs HiGHS, ${v.bruteForce.toLocaleString('en-US')} CP vs brute force; no disagreement left`;
+  $('kpi-fuzz-note').textContent =
+    `${v.mipFuzz.toLocaleString('en-US')} LP/MIP and ${v.qpFuzz.total} QP vs HiGHS, ${v.bruteForce.toLocaleString('en-US')} CP vs brute force, ` +
+    `${v.globalFuzz ?? 0} non-convex QP/QCP vs grid search; no disagreement left`;
   $('kpi-tests').textContent = String(v.tests);
   $('kpi-tests-note').textContent = `and all ${v.tutorial} OPL Studio tutorial files`;
   $('corpus-caption').textContent =
@@ -62,7 +64,7 @@ function renderVerification(v) {
   stackedBar($('corpus-chart'), [
     { label: 'Finish', value: c.finished, color: 'var(--good)', icon: '✓', ink: '#0b0b0b' },
     { label: 'Stop at the time limit (hard puzzles)', value: c.atLimit, color: 'var(--warning)', icon: '⏱', ink: '#0b0b0b' },
-    { label: 'Fail (shell commands, too large, invalid, unsupported)', value: c.other, color: 'var(--critical)', icon: '✕' },
+    { label: 'Fail (shell commands, too large, slow script, invalid)', value: c.other, color: 'var(--critical)', icon: '✕' },
   ]);
 }
 

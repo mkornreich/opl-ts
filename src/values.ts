@@ -182,6 +182,8 @@ export type Value =
   | import('./eval.js').VarIndexed
   | import('./eval.js').Predicate
   | import('./eval.js').PwlFunction
+  | import('./cp/terms.js').StepFunction
+  | import('./cp/terms.js').Sequence
   | import('./eval.js').CumulExpr
   | HostObject;
 
@@ -327,7 +329,10 @@ export function formatValue(v: Value, t: Type, style: FormatStyle): string {
   }
   if (v instanceof Activity) {
     const n = (x: DVar | number) => formatNumber(typeof x === 'number' ? x : x.value, true, style);
-    return `[${n(v.start)} -- ${n(v.duration)} --> ${n(v.end)}]`;
+    if (v.presence && v.presence.value === 0) return 'absent';
+    // Calendar intervals: the length (end - start) differs from the size.
+    const len = v.intensity || v.breakable ? v.end.value - v.start.value : null;
+    return `[${n(v.start)} -- ${len === null ? n(v.duration) : formatNumber(len, true, style)} --> ${n(v.end)}]`;
   }
   if (v instanceof Resource) return v.name;
   if (v instanceof CPConstraint) return 'constraint';

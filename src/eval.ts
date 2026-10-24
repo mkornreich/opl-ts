@@ -5,7 +5,7 @@
 
 import type { Binder, Dim, Expr, Quantifier, TypeExpr } from './ast.js';
 import { fail, type SourcePos } from './errors.js';
-import { Activity, CPConstraint, Flattener, isIntegral, linBounds, Resource, type CmpOp, type CPCons, type CPHooks } from './cp/terms.js';
+import { Activity, CP_MAXINT, CPConstraint, Flattener, isIntegral, linBounds, Resource, Sequence, StepFunction, type CmpOp, type CPCons, type CPHooks } from './cp/terms.js';
 import { ConstraintRef, DVar, isLinear, LinExpr, linAdd, linMul, type Linear } from './linear.js';
 import { checkMemory } from './solver/memory.js';
 import {
@@ -293,6 +293,21 @@ export class Evaluator {
         slopes.push(this.num(e.last, s));
         const f = new PwlFunction(slopes, bps, e.origin ? this.num(e.origin[0], s) : 0, e.origin ? this.num(e.origin[1], s) : 0);
         return e.operand ? this.applyPwl(f, this.eval(e.operand, s), e.pos) : f;
+      }
+      case 'stepwise': {
+        const values: number[] = [];
+        const points: number[] = [];
+        const add = (sc: Scope) => {
+          for (const it of e.items) {
+            values.push(this.num(it.slope, sc));
+            points.push(this.num(it.bp, sc));
+          }
+        };
+        if (e.q) this.forEach(e.q, s, add);
+        else add(s);
+        values.push(this.num(e.last, s));
+        for (let k = 1; k < points.length; k++) if (points[k] < points[k - 1]) fail('stepwise points must be increasing', e.pos);
+        return new StepFunction(values, points);
       }
     }
   }
@@ -963,7 +978,8 @@ export class Evaluator {
       case 'sizeOf':
       case 'lengthOf': {
         const a = this.activityArg(args[0], pos);
-        const v: Linear = fn === 'startOf' ? a.start : fn === 'endOf' ? a.end : a.duration;
+        const v: Linear =
+          fn === 'startOf' ? a.start : fn === 'endOf' ? a.end : fn === 'lengthOf' && (a.intensity || a.breakable) ? linAdd(a.end, a.start, -1) : a.duration;
         if (!a.presence || this.phase === 'post') return this.phase === 'post' && a.presence && dvarValue(a.presence) === 0 ? (args[1] ?? 0) : v;
         // absent intervals take the value given as second argument (default 0)
         const absent = args[1] === undefined ? 0 : this.linear(args[1], pos);
@@ -991,9 +1007,74 @@ export class Evaluator {
       case 'startAtEnd':
         return this.ifPresent(args, this.temporal('start', 'end', args, pos, '=', undefined, true), pos);
       case 'noOverlap': {
+        if (args[0] instanceof Sequence) return this.noOverlapSequence(args[0], args[1], pos);
         const acts = this.leaves(args[0]).map((a) => this.activityArg(a, pos));
         const res = new Resource(`noOverlap#${++this.noOverlaps}`, 'unary', 1, 0);
         return this.usesAll(acts.map((act) => ({ act, height: 1 })), res, pos);
+      }
+      case 'alternative':
+        return this.alternative(args, pos);
+      case 'span':
+        return this.span(args, pos);
+      case 'synchronize': {
+        const a = this.activityArg(args[0], pos);
+        let c: CPCons = { k: 'const', value: true };
+        for (const b of this.leaves(args[1]).map((x) => this.activityArg(x, pos))) {
+          const same: CPCons = { k: 'and', a: { k: 'cmp', op: '=', l: b.start, r: a.start }, b: { k: 'cmp', op: '=', l: b.end, r: a.end } };
+          c = { k: 'and', a: c, b: { k: 'imp', a: this.presentCons([a, b]), b: same } };
+        }
+        return new CPConstraint(c);
+      }
+      case 'first':
+      case 'last':
+      case 'before':
+      case 'prev':
+        if (args[0] instanceof Sequence) return this.sequenceOrder(fn, args[0], args.slice(1), pos);
+        return undefined;
+      case 'typeOfNext':
+      case 'startOfNext':
+      case 'endOfNext':
+      case 'sizeOfNext':
+      case 'lengthOfNext':
+      case 'typeOfPrev':
+      case 'startOfPrev':
+      case 'endOfPrev':
+      case 'sizeOfPrev':
+      case 'lengthOfPrev':
+        if (!(args[0] instanceof Sequence)) fail(`${fn} needs a sequence variable`, pos);
+        return this.neighbour(fn, args[0], args.slice(1), pos);
+      case 'forbidStart':
+      case 'forbidEnd':
+      case 'forbidExtent': {
+        const a = this.activityArg(args[0], pos);
+        const f = args[1];
+        if (!(f instanceof StepFunction)) fail(`${fn} needs a stepFunction`, pos);
+        let c: CPCons = { k: 'const', value: true };
+        for (const [from, to] of f.zeros()) {
+          // start / end / the whole interval outside [from, to)
+          const out: CPCons =
+            fn === 'forbidStart'
+              ? { k: 'or', a: { k: 'cmp', op: '<', l: a.start, r: from }, b: { k: 'cmp', op: '>=', l: a.start, r: to } }
+              : fn === 'forbidEnd'
+                ? { k: 'or', a: { k: 'cmp', op: '<=', l: a.end, r: from }, b: { k: 'cmp', op: '>', l: a.end, r: to } }
+                : { k: 'or', a: { k: 'cmp', op: '<=', l: a.end, r: from }, b: { k: 'or', a: { k: 'cmp', op: '>=', l: a.start, r: to }, b: { k: 'cmp', op: '=', l: a.end, r: a.start } } };
+          c = { k: 'and', a: c, b: out };
+        }
+        return new CPConstraint({ k: 'imp', a: this.presentCons([a]), b: c });
+      }
+      case 'addBreak':
+      case 'addPeriodicBreak': {
+        // OPL 3 resource breaks: addBreak(r, from, to), addPeriodicBreak(r, from, length, period, until).
+        const r = args[0];
+        if (!(r instanceof Resource)) fail(`${fn} needs a resource`, pos);
+        const n = (k: number) => (typeof args[k] === 'number' ? (args[k] as number) : fail(`${fn}: argument ${k + 1} must be a number`, pos));
+        if (fn === 'addBreak') r.breaks.push([n(1), n(2)]);
+        else {
+          const [from, len, period, until] = [n(1), n(2), n(3), n(4)];
+          if (period <= 0) fail('addPeriodicBreak needs a positive period', pos);
+          for (let t = from; t < until; t += period) r.breaks.push([t, Math.min(t + len, until)]);
+        }
+        return new CPConstraint({ k: 'const', value: true });
       }
       case 'pulse': {
         const act = this.activityArg(args[0], pos);
@@ -1125,6 +1206,237 @@ export class Evaluator {
     let cond: CPCons = { k: 'cmp', op: '=', l: ps[0], r: 1 };
     if (ps[1]) cond = { k: 'and', a: cond, b: { k: 'cmp', op: '=', l: ps[1], r: 1 } };
     return new CPConstraint({ k: 'imp', a: cond, b: c.c });
+  }
+
+  /** All of the activities are present. */
+  private presentCons(acts: Activity[]): CPCons {
+    let c: CPCons = { k: 'const', value: true };
+    for (const a of acts) if (a.presence) c = { k: 'and', a: c, b: { k: 'cmp', op: '=', l: a.presence, r: 1 } };
+    return c;
+  }
+
+  private presenceLin(a: Activity): Linear {
+    return a.presence ?? 1;
+  }
+
+  /** alternative(a, B[, c]): a is present iff c members of B are, and they coincide with it. */
+  private alternative(args: Value[], pos: SourcePos): CPConstraint {
+    const a = this.activityArg(args[0], pos);
+    const bs = this.leaves(args[1]).map((x) => this.activityArg(x, pos));
+    const card = args[2] === undefined ? 1 : this.linear(args[2], pos);
+    const sum = new LinExpr();
+    for (const b of bs) sum.addScaled(this.presenceLin(b), 1);
+    const want = a.presence ? (typeof card === 'number' ? linMul(card, a.presence, pos) : this.flat(pos).mul(card, a.presence)) : card;
+    let c: CPCons = { k: 'cmp', op: '=', l: sum, r: want };
+    for (const b of bs) {
+      const same: CPCons = { k: 'and', a: { k: 'cmp', op: '=', l: b.start, r: a.start }, b: { k: 'cmp', op: '=', l: b.end, r: a.end } };
+      c = { k: 'and', a: c, b: b.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: b.presence, r: 1 }, b: same } : same };
+    }
+    return new CPConstraint(c);
+  }
+
+  /** span(a, B): a is present iff some member of B is, and covers exactly the present ones. */
+  private span(args: Value[], pos: SourcePos): CPConstraint {
+    const a = this.activityArg(args[0], pos);
+    const bs = this.leaves(args[1]).map((x) => this.activityArg(x, pos));
+    if (!bs.length) return new CPConstraint(a.presence ? { k: 'cmp', op: '=', l: a.presence, r: 0 } : { k: 'const', value: false });
+    const flat = this.flat(pos);
+    let any: CPCons = { k: 'const', value: false };
+    for (const b of bs) any = b.presence ? { k: 'or', a: any, b: { k: 'cmp', op: '=', l: b.presence, r: 1 } } : { k: 'const', value: true };
+    let c: CPCons = a.presence ? { k: 'equiv', a: { k: 'cmp', op: '=', l: a.presence, r: 1 }, b: any } : any;
+    // Absent members do not count: their start reads as +big, their end as -big.
+    const big = CP_MAXINT >> 2;
+    const starts = bs.map((b) => (b.presence ? linAdd(flat.mul(b.presence, linAdd(b.start, -big, 1)), big, 1) : b.start));
+    const ends = bs.map((b) => (b.presence ? linAdd(flat.mul(b.presence, linAdd(b.end, big, 1)), -big, 1) : b.end));
+    const cover: CPCons = {
+      k: 'and',
+      a: { k: 'cmp', op: '=', l: a.start, r: flat.minmax(starts, true) },
+      b: { k: 'cmp', op: '=', l: a.end, r: flat.minmax(ends, false) },
+    };
+    c = { k: 'and', a: c, b: a.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: a.presence, r: 1 }, b: cover } : cover };
+    return new CPConstraint(c);
+  }
+
+  /** noOverlap(sequence[, transition distances]): no two present intervals overlap, with setup times between types. */
+  private noOverlapSequence(seq: Sequence, matrix: Value | undefined, pos: SourcePos): CPConstraint {
+    const res = new Resource(`noOverlap#${++this.noOverlaps}`, 'unary', 1, 0);
+    let c = this.usesAll(seq.acts.map((act) => ({ act, height: 1 })), res, pos).c;
+    if (matrix === undefined) return new CPConstraint(c);
+    const dist = this.transitionDistance(matrix, pos);
+    const acts = seq.acts;
+    for (let i = 0; i < acts.length; i++) {
+      for (let j = i + 1; j < acts.length; j++) {
+        const dij = dist(seq.types[i], seq.types[j]);
+        const dji = dist(seq.types[j], seq.types[i]);
+        if (!dij && !dji) continue;
+        const [a, b] = [acts[i], acts[j]];
+        const order: CPCons = {
+          k: 'or',
+          a: { k: 'cmp', op: '<=', l: linAdd(a.end, dij, 1), r: b.start },
+          b: { k: 'cmp', op: '<=', l: linAdd(b.end, dji, 1), r: a.start },
+        };
+        c = { k: 'and', a: c, b: { k: 'imp', a: this.presentCons([a, b]), b: order } };
+      }
+    }
+    return new CPConstraint(c);
+  }
+
+  /** A transition distance matrix: int M[T][T] or a set of <from, to, distance> tuples. */
+  private transitionDistance(m: Value, pos: SourcePos): (a: number, b: number) => number {
+    if (m instanceof OplArray) {
+      return (a, b) => {
+        const row = m.items[m.index.indexOf(a)];
+        if (!(row instanceof OplArray)) fail(`no transition distances for type ${a}`, pos);
+        const v = row.items[row.index.indexOf(b)];
+        return typeof v === 'number' ? v : fail(`no transition distance from type ${a} to ${b}`, pos);
+      };
+    }
+    const elems = elementsOf(m);
+    if (!elems) fail('a transition distance needs a matrix or a set of <from, to, distance> tuples', pos);
+    const table = new Map<string, number>();
+    for (const t of elems) {
+      if (!(t instanceof OplTuple) || t.values.length < 3) fail('transition tuples are <from, to, distance>', pos);
+      table.set(`${t.values[0]},${t.values[1]}`, Number(t.values[2]));
+    }
+    return (a, b) => table.get(`${a},${b}`) ?? 0;
+  }
+
+  private seqIndex(seq: Sequence, v: Value, pos: SourcePos): number {
+    const a = this.activityArg(v, pos);
+    const i = seq.acts.indexOf(a);
+    if (i < 0) fail(`${a.name} is not in sequence ${seq.name}`, pos);
+    return i;
+  }
+
+  /** first / last / before / prev on a sequence (whose intervals do not overlap). */
+  private sequenceOrder(fn: string, seq: Sequence, args: Value[], pos: SourcePos): Value {
+    const acts = seq.acts;
+    if (this.phase === 'post') {
+      const order = this.solvedOrder(seq);
+      const at = (v: Value) => order.indexOf(this.activityArg(v, pos));
+      const [x, y] = [at(args[0]), args[1] === undefined ? -1 : at(args[1])];
+      if (fn === 'first') return x < 0 || x === 0 ? 1 : 0;
+      if (fn === 'last') return x < 0 || x === order.length - 1 ? 1 : 0;
+      if (x < 0 || y < 0) return 1;
+      return fn === 'before' ? (x < y ? 1 : 0) : y === x + 1 ? 1 : 0;
+    }
+    const i = this.seqIndex(seq, args[0], pos);
+    const a = acts[i];
+    if (fn === 'first' || fn === 'last') {
+      let c: CPCons = { k: 'const', value: true };
+      for (const b of acts) {
+        if (b === a) continue;
+        const o: CPCons = fn === 'first' ? { k: 'cmp', op: '<=', l: a.end, r: b.start } : { k: 'cmp', op: '<=', l: b.end, r: a.start };
+        c = { k: 'and', a: c, b: b.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: b.presence, r: 1 }, b: o } : o };
+      }
+      return new CPConstraint({ k: 'imp', a: this.presentCons([a]), b: c });
+    }
+    const j = this.seqIndex(seq, args[1], pos);
+    const b = acts[j];
+    if (fn === 'before') return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '<=', l: a.end, r: b.start } });
+    const next = this.successors(seq, pos);
+    return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '=', l: next.n[i][j], r: 1 } });
+  }
+
+  /** The present intervals of a solved sequence, in start order. */
+  private solvedOrder(seq: Sequence): Activity[] {
+    return seq.acts
+      .filter((a) => !a.presence || dvarValue(a.presence) === 1)
+      .sort((x, y) => Number(dvarValue(x.start)) - Number(dvarValue(y.start)) || Number(dvarValue(x.end)) - Number(dvarValue(y.end)));
+  }
+
+  private readonly successorModels = new WeakMap<Sequence, { n: DVar[][]; last: Linear[]; first: Linear[] }>();
+
+  /**
+   * Successor booleans n[a][b] (b directly follows a) for a sequence whose
+   * intervals do not overlap, with last[a] / first[a] = present and no
+   * successor / predecessor.
+   */
+  private successors(seq: Sequence, pos: SourcePos): { n: DVar[][]; last: Linear[]; first: Linear[] } {
+    const cached = this.successorModels.get(seq);
+    if (cached) return cached;
+    const flat = this.flat(pos);
+    const acts = seq.acts;
+    const k = acts.length;
+    const n = acts.map((a, i) => acts.map((b, j) => flat.h.newVar(0, i === j ? 0 : 1, true, `next(${a.name},${b.name})`)));
+    const post = (c: CPCons) => flat.h.define({ k: 'post', cons: c });
+    const p = (a: Activity): CPCons => (a.presence ? { k: 'cmp', op: '=', l: a.presence, r: 1 } : { k: 'const', value: true });
+    for (let i = 0; i < k; i++) {
+      const out = new LinExpr();
+      const inn = new LinExpr();
+      for (let j = 0; j < k; j++) {
+        out.addScaled(n[i][j], 1);
+        inn.addScaled(n[j][i], 1);
+      }
+      post({ k: 'cmp', op: '<=', l: out, r: this.presenceLin(acts[i]) });
+      post({ k: 'cmp', op: '<=', l: inn, r: this.presenceLin(acts[i]) });
+      for (let j = 0; j < k; j++) {
+        if (i === j) continue;
+        const [a, b] = [acts[i], acts[j]];
+        // b next after a: both present, a before b, nothing in between.
+        let between: CPCons = { k: 'and', a: { k: 'and', a: p(a), b: p(b) }, b: { k: 'cmp', op: '<=', l: a.end, r: b.start } };
+        for (let m = 0; m < k; m++) {
+          if (m === i || m === j) continue;
+          const c = acts[m];
+          const outside: CPCons = { k: 'or', a: { k: 'cmp', op: '<=', l: c.end, r: a.start }, b: { k: 'cmp', op: '<=', l: b.end, r: c.start } };
+          between = { k: 'and', a: between, b: c.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: c.presence, r: 1 }, b: outside } : outside };
+        }
+        post({ k: 'imp', a: { k: 'cmp', op: '=', l: n[i][j], r: 1 }, b: between });
+        // Something after a: a has a successor.
+        post({ k: 'imp', a: { k: 'and', a: { k: 'and', a: p(a), b: p(b) }, b: { k: 'cmp', op: '<=', l: a.end, r: b.start } }, b: { k: 'cmp', op: '=', l: out, r: 1 } });
+      }
+    }
+    const last = acts.map((a, i) => linAdd(this.presenceLin(a), n[i].reduce((e, v) => e.addScaled(v, 1), new LinExpr()), -1));
+    const first = acts.map((a, i) => linAdd(this.presenceLin(a), acts.reduce((e, _, j) => e.addScaled(n[j][i], 1), new LinExpr()), -1));
+    const model = { n, last, first };
+    this.successorModels.set(seq, model);
+    return model;
+  }
+
+  /** typeOfNext / startOfNext / ... / lengthOfPrev(sequence, a, lastValue, absentValue). */
+  private neighbour(fn: string, seq: Sequence, args: Value[], pos: SourcePos): Value {
+    const i = this.seqIndex(seq, args[0], pos);
+    const a = seq.acts[i];
+    const isNext = fn.endsWith('Next');
+    const what = fn.slice(0, fn.length - 4);
+    const value = (j: number): Linear => {
+      const b = seq.acts[j];
+      if (what === 'typeOf') return seq.types[j];
+      if (what === 'startOf') return b.start;
+      if (what === 'endOf') return b.end;
+      if (what === 'lengthOf') return linAdd(b.end, b.start, -1);
+      return b.duration;
+    };
+    const lastVal = args[1] === undefined ? (what === 'typeOf' ? seq.types[i] : 0) : this.linear(args[1], pos);
+    const absVal = args[2] === undefined ? 0 : this.linear(args[2], pos);
+    if (this.phase === 'post') {
+      if (a.presence && dvarValue(a.presence) === 0) return absVal;
+      const order = this.solvedOrder(seq);
+      const at = order.indexOf(a) + (isNext ? 1 : -1);
+      if (at < 0 || at >= order.length) return lastVal;
+      const j = seq.acts.indexOf(order[at]);
+      const b = seq.acts[j];
+      const num = (x: DVar | number) => (typeof x === 'number' ? x : Number(dvarValue(x)));
+      if (what === 'typeOf') return seq.types[j];
+      if (what === 'startOf') return num(b.start);
+      if (what === 'endOf') return num(b.end);
+      if (what === 'lengthOf') return num(b.end) - num(b.start);
+      return num(b.duration);
+    }
+    const flat = this.flat(pos);
+    const { n, last, first } = this.successors(seq, pos);
+    let e: Linear = 0;
+    seq.acts.forEach((_, j) => {
+      if (j === i) return;
+      const link = isNext ? n[i][j] : n[j][i];
+      const v = value(j);
+      e = linAdd(e, typeof v === 'number' ? linMul(v, link, pos) : flat.mul(link, v), 1);
+    });
+    const end = isNext ? last[i] : first[i];
+    e = linAdd(e, typeof lastVal === 'number' ? linMul(lastVal, end, pos) : flat.mul(flat.atom(end), lastVal), 1);
+    const absent = linAdd(1, this.presenceLin(a), -1);
+    e = linAdd(e, typeof absVal === 'number' ? linMul(absVal, absent, pos) : flat.mul(flat.atom(absent), absVal), 1);
+    return e;
   }
 
   /** Requirements of several activities on one resource (presence = the interval's own presence). */
@@ -1393,6 +1705,8 @@ export class Evaluator {
         return UNKNOWN;
       case 'piecewise':
         return e.operand ? FLOAT : UNKNOWN;
+      case 'stepwise':
+        return UNKNOWN;
     }
   }
 

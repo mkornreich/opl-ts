@@ -273,9 +273,33 @@ describe('quadratic programming', () => {
     assert.deepEqual([(miqp.m.getField('x')!.value as DVar).value, (miqp.m.getField('y')!.value as DVar).value], [2, 1]);
   });
 
-  it('leaves non-convex objectives to constraint programming', () => {
-    const { info } = solve('dvar float x in -1..2; dvar int k in 0..3; minimize -x * x + k; subject to { x + k >= 1; }');
-    assert.equal(info.solver, 'CP');
+  it('solves non-convex objectives globally (spatial branch and bound)', () => {
+    const { info, m } = solve('dvar float x in -1..2; dvar float y in -3..1; minimize -x^2 - 2*y^2 + x*y; subject to { x + y <= 1.5; }');
+    assert.equal(info.solver, 'QP');
+    assert.ok(Math.abs(info.objective - -28) < 1e-6);
+    assert.deepEqual([(m.getField('x')!.value as DVar).value, (m.getField('y')!.value as DVar).value], [2, -3]);
+  });
+
+  it('solves quadratic constraints: convex, bilinear (Haverly pooling) and mixed-integer', () => {
+    const disk = solve('dvar float x in -infinity..infinity; dvar float y in -infinity..infinity; minimize x + y; subject to { x^2 + y^2 <= 1; }');
+    assert.equal(disk.info.solver, 'QCP');
+    assert.ok(Math.abs(disk.info.objective + Math.SQRT2) < 1e-5);
+    const haverly = solve(`
+      dvar float+ x1; dvar float+ x2; dvar float+ y1; dvar float+ y2; dvar float+ z1; dvar float+ z2;
+      dvar float p in 1..3;
+      maximize 9 * (y1 + z1) + 15 * (y2 + z2) - 6 * x1 - 16 * x2 - 10 * (z1 + z2);
+      subject to {
+        x1 + x2 == y1 + y2;
+        p * (y1 + y2) == 3 * x1 + x2;
+        p * y1 + 2 * z1 <= 2.5 * (y1 + z1);
+        p * y2 + 2 * z2 <= 1.5 * (y2 + z2);
+        y1 + z1 <= 100;
+        y2 + z2 <= 200;
+      }`);
+    assert.ok(Math.abs(haverly.info.objective - 400) < 1e-4);
+    const mixed = solve('dvar int n in 0..10; dvar float r in 0..10; maximize 3 * n + r; subject to { n * n + r * r <= 30; n <= 2 * r; }');
+    assert.equal(mixed.info.solver, 'MIQCP');
+    assert.ok(Math.abs(mixed.info.objective - (12 + Math.sqrt(14))) < 1e-5);
   });
 });
 

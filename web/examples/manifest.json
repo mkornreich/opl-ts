@@ -1,12 +1,21 @@
 {
-  "categories": ["Linear programming", "Integer programming", "Quadratic programming", "Constraint programming", "Scheduling", "Scripts"],
+  "categories": [
+    "Linear programming",
+    "Integer programming",
+    "Quadratic programming",
+    "Constraint programming",
+    "Scheduling",
+    "Scripts"
+  ],
   "examples": [
     {
       "id": "transport",
       "title": "Transportation",
       "category": "Linear programming",
       "summary": "Dantzig's cannery problem: ship cases from two plants to three markets at least freight cost. The demand rows' duals are the marginal delivery costs.",
-      "files": ["web/examples/transport.mod"],
+      "files": [
+        "web/examples/transport.mod"
+      ],
       "main": "transport.mod",
       "data": []
     },
@@ -16,7 +25,11 @@
       "category": "Linear programming",
       "source": "OPL Studio tutorial, MIT 1.206J",
       "summary": "The tutorial's first project: enums, a .dat file and a .prj with hide_zero. Choose production levels within component stocks to maximise profit.",
-      "files": ["tutorial/files/gas.prj", "tutorial/files/gas.mod", "tutorial/files/gas.dat"],
+      "files": [
+        "tutorial/files/gas.prj",
+        "tutorial/files/gas.mod",
+        "tutorial/files/gas.dat"
+      ],
       "main": "gas.prj",
       "data": []
     },
@@ -26,7 +39,11 @@
       "category": "Linear programming",
       "source": "OPL Studio tutorial, MIT 1.206J",
       "summary": "Inside or outside production with structs and display statements.",
-      "files": ["tutorial/files/product.prj", "tutorial/files/product.mod", "tutorial/files/product.dat"],
+      "files": [
+        "tutorial/files/product.prj",
+        "tutorial/files/product.mod",
+        "tutorial/files/product.dat"
+      ],
       "main": "product.prj",
       "data": []
     },
@@ -35,9 +52,14 @@
       "title": "Warehouse location",
       "category": "Integer programming",
       "summary": "IBM's facility-location sample: open warehouses and assign each store to an open one, trading fixed costs against supply costs.",
-      "files": ["web/examples/warehouse.mod", "web/examples/warehouse.dat"],
+      "files": [
+        "web/examples/warehouse.mod",
+        "web/examples/warehouse.dat"
+      ],
       "main": "warehouse.mod",
-      "data": ["warehouse.dat"]
+      "data": [
+        "warehouse.dat"
+      ]
     },
     {
       "id": "covering",
@@ -45,7 +67,11 @@
       "category": "Integer programming",
       "source": "OPL Studio tutorial, MIT 1.206J",
       "summary": "Set covering for airline crews: pick the cheapest crews so that every flight is covered.",
-      "files": ["tutorial/files/covering.prj", "tutorial/files/covering.mod", "tutorial/files/covering.dat"],
+      "files": [
+        "tutorial/files/covering.prj",
+        "tutorial/files/covering.mod",
+        "tutorial/files/covering.dat"
+      ],
       "main": "covering.prj",
       "data": []
     },
@@ -55,7 +81,11 @@
       "category": "Integer programming",
       "source": "OPL Studio tutorial, MIT 1.206J",
       "summary": "A multi-resource integer knapsack, solved by branch and bound.",
-      "files": ["tutorial/files/knapsack.prj", "tutorial/files/knapsack.mod", "tutorial/files/knapsack.dat"],
+      "files": [
+        "tutorial/files/knapsack.prj",
+        "tutorial/files/knapsack.mod",
+        "tutorial/files/knapsack.dat"
+      ],
       "main": "knapsack.prj",
       "data": []
     },
@@ -64,8 +94,21 @@
       "title": "Portfolio",
       "category": "Quadratic programming",
       "summary": "Markowitz: the minimum-variance mix of five assets that reaches a target expected return. A convex QP.",
-      "files": ["web/examples/portfolio.mod"],
+      "files": [
+        "web/examples/portfolio.mod"
+      ],
       "main": "portfolio.mod",
+      "data": []
+    },
+    {
+      "id": "pooling",
+      "title": "Pooling (non-convex)",
+      "category": "Quadratic programming",
+      "summary": "Haverly's pooling problem: bilinear quality constraints make it non-convex; spatial branch and bound proves the global optimum of 400.",
+      "files": [
+        "web/examples/pooling.mod"
+      ],
+      "main": "pooling.mod",
       "data": []
     },
     {
@@ -73,7 +116,9 @@
       "title": "N queens",
       "category": "Constraint programming",
       "summary": "Twelve queens on a 12 × 12 board, none attacking another, with three allDifferent constraints.",
-      "files": ["web/examples/queens.mod"],
+      "files": [
+        "web/examples/queens.mod"
+      ],
       "main": "queens.mod",
       "data": []
     },
@@ -82,7 +127,9 @@
       "title": "SEND + MORE = MONEY",
       "category": "Constraint programming",
       "summary": "The classic cryptarithm: a different digit for each letter.",
-      "files": ["web/examples/sendmore.mod"],
+      "files": [
+        "web/examples/sendmore.mod"
+      ],
       "main": "sendmore.mod",
       "data": []
     },
@@ -91,7 +138,9 @@
       "title": "Sudoku",
       "category": "Constraint programming",
       "summary": "Rows, columns and boxes as allDifferent constraints; propagation does most of the work.",
-      "files": ["web/examples/sudoku.mod"],
+      "files": [
+        "web/examples/sudoku.mod"
+      ],
       "main": "sudoku.mod",
       "data": []
     },
@@ -100,8 +149,32 @@
       "title": "Job shop ft06",
       "category": "Scheduling",
       "summary": "Fisher and Thompson's 6 × 6 benchmark with CP Optimizer interval variables and noOverlap. The proven optimum is a makespan of 55.",
-      "files": ["web/examples/jobshop.mod"],
+      "files": [
+        "web/examples/jobshop.mod"
+      ],
       "main": "jobshop.mod",
+      "data": []
+    },
+    {
+      "id": "setup",
+      "title": "Setup times",
+      "category": "Scheduling",
+      "summary": "A sequence variable with job families: noOverlap with a setup-time matrix, and the setup cost through typeOfNext.",
+      "files": [
+        "web/examples/setup.mod"
+      ],
+      "main": "setup.mod",
+      "data": []
+    },
+    {
+      "id": "calendar",
+      "title": "Work calendar",
+      "category": "Scheduling",
+      "summary": "Interval intensity from a step function: tasks stop over weekends, and inspections may not touch one (forbidExtent).",
+      "files": [
+        "web/examples/calendar.mod"
+      ],
+      "main": "calendar.mod",
       "data": []
     },
     {
@@ -109,7 +182,9 @@
       "title": "House building",
       "category": "Scheduling",
       "summary": "OPL 3 activities on three workers chosen by AlternativeResources; minimise the longest time a worker is on site.",
-      "files": ["web/examples/house.mod"],
+      "files": [
+        "web/examples/house.mod"
+      ],
       "main": "house.mod",
       "data": []
     },
@@ -118,7 +193,9 @@
       "title": "Efficient frontier",
       "category": "Scripts",
       "summary": "A main block in IBM ILOG Script that builds and solves one QP per target return.",
-      "files": ["web/examples/frontier.mod"],
+      "files": [
+        "web/examples/frontier.mod"
+      ],
       "main": "frontier.mod",
       "data": []
     },
@@ -127,18 +204,32 @@
       "title": "Solution pool",
       "category": "Scripts",
       "summary": "cplex.populate() keeps the optimum and enumerates every other feasible basket.",
-      "files": ["web/examples/pool.mod"],
+      "files": [
+        "web/examples/pool.mod"
+      ],
       "main": "pool.mod",
       "data": []
     }
   ],
   "verification": {
-    "corpus": { "models": 316, "repositories": 55, "noData": 72, "finished": 217, "atLimit": 20, "other": 7 },
-    "highsAgree": 46,
-    "mipFuzz": 1200,
-    "qpFuzz": { "total": 789, "agree": 730, "highsWrong": 59 },
+    "corpus": {
+      "models": 316,
+      "repositories": 55,
+      "noData": 71,
+      "finished": 221,
+      "atLimit": 18,
+      "other": 6
+    },
+    "highsAgree": 47,
+    "mipFuzz": 2400,
+    "qpFuzz": {
+      "total": 1085,
+      "agree": 1006,
+      "highsWrong": 79
+    },
     "bruteForce": 1000,
-    "tests": 66,
-    "tutorial": 12
+    "tests": 73,
+    "tutorial": 12,
+    "globalFuzz": 1200
   }
 }

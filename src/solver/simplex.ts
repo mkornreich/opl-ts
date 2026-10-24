@@ -24,6 +24,8 @@ export interface Simplex {
   iterations: number;
   deadline: number;
   timedOut: boolean;
+  /** The solution lost accuracy (dense tableau); solve again with the sparse simplex. */
+  unstable?: boolean;
   solve(maxIterations?: number): SimplexStatus;
   dual(): SimplexStatus | null;
   setBounds(j: number, lo: number, hi: number): void;
@@ -50,7 +52,13 @@ export function solveLP(
   upper: Float64Array = lp.upper,
   options: SimplexOptions = {},
 ): LPResult {
-  const s = createSimplex(lp, lower, upper);
+  let s = createSimplex(lp, lower, upper);
   if (options.deadline !== undefined) s.deadline = options.deadline;
-  return s.result(s.solve(options.maxIterations));
+  let st = s.solve(options.maxIterations);
+  if (st === 'optimal' && s.unstable) {
+    s = new SparseSimplex(lp, lower, upper);
+    if (options.deadline !== undefined) s.deadline = options.deadline;
+    st = s.solve(options.maxIterations);
+  }
+  return s.result(st);
 }

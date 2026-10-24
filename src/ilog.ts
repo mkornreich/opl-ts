@@ -59,6 +59,7 @@ function oplString(v: Value, inner: boolean): string {
   if (v instanceof OplTuple) return '<' + v.values.map((x) => oplString(x, true)).join(' ') + '>';
   if (v instanceof Activity) {
     const n = (x: DVar | number) => (typeof x === 'number' ? x : x.value);
+    if (v.presence && v.presence.value === 0) return '<0 0 0 0>';
     return `<1 ${n(v.start)} ${n(v.end)} ${n(v.duration)}>`;
   }
   if (v instanceof ConstraintRef) return v.name;
@@ -121,21 +122,28 @@ export class IlogRuntime {
         }
       },
       thisOplModel: this.modelObject(model),
-      IloOplModelSource: function (this: { file: string }, file: string) {
+      IloOplModelSource: function (this: { file: string; end(): void }, file: string) {
         this.file = rt.resolve(file);
+        this.end = () => {};
       },
-      IloOplModelDefinition: function (this: { ast: ModelAst }, src: { file: string }) {
+      IloOplModelDefinition: function (this: { ast: ModelAst; end(): void }, src: { file: string }) {
         this.ast = parseModel(fs.readFileSync(src.file, 'utf8'), src.file);
+        this.end = () => {};
       },
-      IloOplDataSource: function (this: { ast: DataAst }, file: string) {
+      IloOplDataSource: function (this: { ast: DataAst; end(): void }, file: string) {
         const f = rt.resolve(file);
         this.ast = parseData(fs.readFileSync(f, 'utf8'), f);
+        this.end = () => {};
       },
       // Data elements set on it (`data.n = 5`) override a model's data in addDataSource.
       IloOplDataElements: function () {
         const overrides = new Map<string, Value>();
         return new Proxy({} as Record<string | symbol, unknown>, {
-          get: (_, p) => (p === OPL ? overrides : typeof p === 'string' && overrides.has(p) ? rt.toJS(overrides.get(p)!) : undefined),
+          get: (_, p) => {
+            if (p === OPL) return overrides;
+            if (p === 'end') return () => {};
+            return typeof p === 'string' && overrides.has(p) ? rt.toJS(overrides.get(p)!) : undefined;
+          },
           set: (_, p, v) => {
             if (typeof p === 'string') overrides.set(p, rt.fromJS(v));
             return true;
@@ -291,7 +299,14 @@ export class IlogRuntime {
     }
     if (v instanceof Activity) {
       const n = (x: DVar | number) => (typeof x === 'number' ? x : x.value);
-      return { [OPL]: v, get start() { return n(v.start); }, get end() { return n(v.end); }, get size() { return n(v.duration); }, present: 1 };
+      return {
+        [OPL]: v,
+        get start() { return n(v.start); },
+        get end() { return n(v.end); },
+        get size() { return n(v.duration); },
+        get length() { return n(v.end) - n(v.start); },
+        get present() { return v.presence ? n(v.presence) : 1; },
+      };
     }
     if (v instanceof RawArray) return v.items.map((x) => this.toJS(x));
     return v;
@@ -524,7 +539,10 @@ export class IlogRuntime {
       applyOpsSettings: () => {},
       convertAllIntVars: () => m.setRelaxation(true),
       unconvertAllIntVars: () => m.setRelaxation(false),
-      printSolution: () => m.printVariables(false),
+      printSolution: () => {
+        m.printVariables(false);
+        return '';
+      },
       printConflict: () => {},
       get modelDefinition() {
         return { ast: m.ast };

@@ -28,6 +28,7 @@ export type Expr =
   | { k: 'namedTuple'; fields: { name: string; value: Expr }[]; pos: SourcePos }
   | { k: 'cond'; c: Expr; a: Expr; b: Expr; pos: SourcePos }
   /** piecewise[(q)]{ slope -> breakpoint; ...; lastSlope } [(x0, y0)] [operand] */
+  | { k: 'stepwise'; q: Quantifier | null; items: { slope: Expr; bp: Expr }[]; last: Expr; pos: SourcePos }
   | { k: 'piecewise'; q: Quantifier | null; items: { slope: Expr; bp: Expr }[]; last: Expr; origin: [Expr, Expr] | null; operand: Expr | null; pos: SourcePos };
 
 export interface Binder {
@@ -107,7 +108,9 @@ export type Stmt =
   | { k: 'dbUpdate'; conn: string; sql: Expr; e: Expr | null; pos: SourcePos }
   | { k: 'search'; body: SStmt[]; pos: SourcePos }
   | { k: 'horizon'; which: 'horizon' | 'origin'; e: Expr; pos: SourcePos }
-  | { k: 'activity'; name: string; dims: Dim[]; duration: Expr | null; breakable: boolean; pos: SourcePos }
+  | { k: 'activity'; name: string; dims: Dim[]; duration: Expr | null; breakable: boolean; transitionType?: Expr | null; pos: SourcePos }
+  /** dvar sequence s[dims] in intervals [types t]; (CP Optimizer) */
+  | { k: 'sequence'; name: string; dims: Dim[]; intervals: Expr; types: Expr | null; pos: SourcePos }
   | { k: 'resource'; kind: ResourceDeclKind; name: string; dims: Dim[]; args: Expr[]; pos: SourcePos };
 
 /** dvar interval a [optional] [in lo..hi] [size s] */
@@ -115,6 +118,8 @@ export interface IntervalSpec {
   optional: boolean;
   window: Expr | null;
   size: Expr | null;
+  /** intensity F: a step function (CP Optimizer calendars). */
+  intensity?: Expr | null;
 }
 
 export type ResourceDeclKind = 'UnaryResource' | 'DiscreteResource' | 'Reservoir' | 'StateResource' | 'AlternativeResources';

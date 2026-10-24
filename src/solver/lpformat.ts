@@ -42,6 +42,8 @@ export function toLpFormat(
   rowNames: string[],
   title = '',
   hessian: Hessian | null = null,
+  /** Quadratic parts of rows (plain coefficients of x_i x_j, i <= j), by row index. */
+  rowQuad: (Hessian | null)[] = [],
 ): string {
   const names = sanitize(varNames, 'x');
   const rows = sanitize(rowNames, 'c');
@@ -74,8 +76,18 @@ export function toLpFormat(
   }
   out.push(` obj: ${objIdx.length ? linear(objIdx, objVal, names) : ''}${quad}${constant ? ` ${constant < 0 ? '-' : '+'} ${num(Math.abs(constant))}` : ''}`.trimEnd());
   out.push('Subject To');
+  const quadBody = (q: Hessian | null | undefined) => {
+    if (!q || !q.v.length) return '';
+    const terms = q.v.map((c, k) => {
+      const [i, j] = [q.i[k], q.j[k]];
+      const t = i === j ? `${names[i]} ^ 2` : `${names[i]} * ${names[j]}`;
+      return `${k === 0 && c > 0 ? '' : c < 0 ? '- ' : '+ '}${num(Math.abs(c))} ${t}`;
+    });
+    return ` + [ ${terms.join(' ')} ]`;
+  };
   lp.rows.forEach((r, i) => {
-    const body = linear(r.index, r.value, names);
+    const q = quadBody(rowQuad[i]);
+    const body = r.index.length || !q ? linear(r.index, r.value, names) + q : q.slice(3);
     if (r.lower === r.upper) out.push(` ${rows[i]}: ${body} = ${num(r.upper)}`);
     else if (isFinite(r.lower) && isFinite(r.upper)) {
       // Ranged row as two one-sided rows: readers disagree on `lo <= expr <= hi`.

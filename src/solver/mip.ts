@@ -13,10 +13,11 @@
  * LP is re-solved to report duals and reduced costs (as CPLEX does for MIPs).
  */
 
-import type { SimplexStatus, Snapshot } from './dense.js';
+import { DenseSimplex, type SimplexStatus, type Snapshot } from './dense.js';
 import { type LinearProgram, type MIPResult } from './lp.js';
 import { memoryExceeded } from './memory.js';
 import { createSimplex, solveLP } from './simplex.js';
+import { SparseSimplex } from './sparse.js';
 
 const INT_TOL = 1e-6;
 
@@ -28,7 +29,13 @@ export interface MIPOptions {
   timeLimit?: number;
   /** Relative optimality gap at which a node is pruned. */
   relativeGap?: number;
+  /** Internal: root cuts on, and a known solution to start from. */
+  cuts?: boolean;
+  start?: { x: Float64Array; objective: number };
 }
+
+/** Nodes after which the search restarts with root cuts. */
+const RESTART_NODES = 2000;
 
 /** A node stores its own bound changes on top of its parent's (bounds are rebuilt when it is processed). */
 interface Node {
@@ -45,7 +52,59 @@ interface Node {
 /** Above this many open nodes, children keep no basis (memory). */
 const MAX_SNAPSHOTS = 2000;
 
-export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult {
+/**
+ * Rounds of Gomory mixed-integer cuts at the root (dense simplex only); the
+ * cuts are valid for every integer solution, so they stay for the whole search.
+ */
+function withRootCuts(lp: LinearProgram, lower: Float64Array, upper: Float64Array, deadline: number): LinearProgram {
+  const n = lp.numVars;
+  const m = lp.rows.length;
+  if (m * (n + 2 * m) > 250_000 || process.env.OPL_LP_ENGINE === 'sparse' || process.env.OPL_NO_CUTS) return lp;
+  // Logical columns are integer when their row has integer coefficients on integer columns.
+  let rows = lp.rows;
+  let last = -Infinity;
+  for (let round = 0; round < 2 && performance.now() < deadline; round++) {
+    const cur = { ...lp, rows };
+    const S = new DenseSimplex(cur, lower, upper);
+    S.deadline = deadline;
+    if (S.solve() !== 'optimal' || S.unstable) break;
+    const obj = S.objective();
+    if (round > 0 && obj - last <= 1e-6 * Math.max(1, Math.abs(obj))) break;
+    last = obj;
+    const colInt = new Uint8Array(S.N);
+    colInt.set(lp.integer);
+    rows.forEach((r, i) => {
+      colInt[n + i] = r.index.every((j, k) => lp.integer[j] && Number.isInteger(r.value[k])) ? 1 : 0;
+    });
+    const cuts = S.gomoryCuts(colInt, 10);
+    if (!cuts.length) break;
+    rows = [...rows, ...cuts];
+  }
+  return rows === lp.rows ? lp : { ...lp, rows };
+}
+
+/**
+ * Branch and bound; a search still open after RESTART_NODES nodes restarts
+ * once with Gomory cuts at the root, keeping its best solution.
+ */
+export function solveMIP(input: LinearProgram, options: MIPOptions = {}): MIPResult {
+  if (options.cuts !== undefined || !input.integer.some((v) => v)) return branchAndBound(input, options);
+  const t0 = performance.now();
+  const maxNodes = options.maxNodes ?? 10_000_000;
+  const first = branchAndBound(input, { ...options, cuts: false, maxNodes: Math.min(maxNodes, RESTART_NODES) });
+  if (first.nodes < RESTART_NODES || maxNodes <= RESTART_NODES || (first.status !== 'feasible' && first.status !== 'limit')) return first;
+  const left = options.timeLimit ? options.timeLimit - (performance.now() - t0) / 1000 : undefined;
+  if (left !== undefined && left <= 0.05) return first;
+  const start = first.status === 'feasible' ? { x: first.x, objective: first.objective } : undefined;
+  const second = branchAndBound(input, { ...options, cuts: true, maxNodes: maxNodes - first.nodes, timeLimit: left, start });
+  second.nodes += first.nodes;
+  second.iterations += first.iterations;
+  if (second.status === 'limit' && first.status === 'feasible') return { ...first, nodes: second.nodes, iterations: second.iterations };
+  return second;
+}
+
+function branchAndBound(input: LinearProgram, options: MIPOptions): MIPResult {
+  let lp = input;
   const n = lp.numVars;
   const ints: number[] = [];
   for (let j = 0; j < n; j++) if (lp.integer[j]) ints.push(j);
@@ -83,7 +142,7 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
   const depthFirst = (options.nodeSelection ?? 1) === 0;
   const maxNodes = options.maxNodes ?? 10_000_000;
   const relGap = options.relativeGap ?? 1e-9;
-  const prop = new BoundPropagator(lp);
+  let prop = new BoundPropagator(lp);
 
   let incumbent = Infinity;
   let bestX: Float64Array | null = null;
@@ -123,7 +182,13 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
   };
 
   if (!prop.run(rootLower, rootUpper, 50)) {
-    return finish(lp, 'infeasible', Infinity, -Infinity, null, iterations, 0, deadline);
+    return finish(input, 'infeasible', Infinity, -Infinity, null, iterations, 0, deadline);
+  }
+  if (options.cuts) lp = withRootCuts(lp, rootLower, rootUpper, deadline);
+  if (lp !== input) prop = new BoundPropagator(lp);
+  if (options.start) {
+    incumbent = options.start.objective;
+    bestX = Float64Array.from(options.start.x);
   }
 
   let S = createSimplex(lp, rootLower, rootUpper);
@@ -146,11 +211,16 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
         if (!S.restore(S.snapshot())) status = null;
       }
     }
-    if (status === null || (status === 'iteration_limit' && !S.timedOut)) {
+    if (status === null || (status === 'iteration_limit' && !S.timedOut) || (status === 'optimal' && S.unstable)) {
       iterations += S.iterations;
-      S = createSimplex(lp, lower, upper);
+      S = status === 'optimal' && S.unstable ? new SparseSimplex(lp, lower, upper) : createSimplex(lp, lower, upper);
       S.deadline = deadline;
       status = S.solve();
+      if (status === 'optimal' && S.unstable) {
+        S = new SparseSimplex(lp, lower, upper);
+        S.deadline = deadline;
+        status = S.solve();
+      }
     }
     stateId = nextState++;
     return status;
@@ -260,13 +330,13 @@ export function solveMIP(lp: LinearProgram, options: MIPOptions = {}): MIPResult
 
   iterations += S.iterations;
   if (unbounded && !bestX) {
-    return finish(lp, 'unbounded', -Infinity, -Infinity, null, iterations, nodes, deadline);
+    return finish(input, 'unbounded', -Infinity, -Infinity, null, iterations, nodes, deadline);
   }
   if (!bestX) {
-    return finish(lp, hitLimit ? 'limit' : 'infeasible', Infinity, -Infinity, null, iterations, nodes, deadline);
+    return finish(input, hitLimit ? 'limit' : 'infeasible', Infinity, -Infinity, null, iterations, nodes, deadline);
   }
   const bound = hitLimit ? Math.min(incumbent, open.minBound()) : incumbent;
-  return finish(lp, hitLimit ? 'feasible' : 'optimal', incumbent, bound, bestX, iterations, nodes, deadline);
+  return finish(input, hitLimit ? 'feasible' : 'optimal', incumbent, bound, bestX, iterations, nodes, deadline);
 }
 
 /** Tightens column bounds from the row activities (in place); false when infeasible. */
@@ -310,6 +380,7 @@ export class BoundPropagator {
         for (let k = 0; k < index.length; k++) {
           const a = value[k];
           const j = index[k];
+          if (a === 0) continue;
           // Contributions of x_j to the minimum and maximum activity.
           const cMin = a > 0 ? (isFinite(lo[j]) ? a * lo[j] : null) : isFinite(hi[j]) ? a * hi[j] : null;
           const cMax = a > 0 ? (isFinite(hi[j]) ? a * hi[j] : null) : isFinite(lo[j]) ? a * lo[j] : null;

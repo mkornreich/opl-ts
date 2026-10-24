@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, it } from 'node:test';
+import { Activity } from '../src/cp/terms.js';
 import { DVar } from '../src/linear.js';
 import { ModelInstance, type ModelOptions } from '../src/model.js';
 import { parseModel, parseScript } from '../src/parser.js';
@@ -212,6 +213,17 @@ describe('constraint programming', () => {
     assert.equal((m.getField('i')!.value as DVar).value, 4);
   });
 
+  it('divides by integer variables without rounding failures (Egyptian fractions)', () => {
+    const { info, m } = solve(`
+      using CP;
+      int m = 4;
+      dvar int+ x[1..m];
+      minimize x[m];
+      subject to { sum(i in 1..m) 1 / x[i] == 1; allDifferent(x); forall(i in 1..m-1) x[i] < x[i+1]; x[m] <= 50; }`);
+    assert.equal(info.objective, 12);
+    assert.deepEqual(values(m.getField('x')?.value), [2, 4, 6, 12]);
+  });
+
   it('keeps fractional and irrational coefficients inside abs and max', () => {
     const { info } = solve(`
       {float} r = { sqrt(i) | i in {2, 3, 5} };
@@ -298,7 +310,85 @@ describe('scheduling', () => {
   });
 });
 
+const SETUP = `
+  using CP;
+  range J = 1..6;
+  int dur[J] = [3, 2, 4, 2, 3, 1];
+  int typ[J] = [0, 1, 2, 0, 1, 2];
+  int setup[0..2][0..2] = [[0, 2, 5], [3, 0, 2], [4, 3, 0]];
+  int cost[0..2][0..2] = [[0, 7, 1], [2, 0, 9], [6, 3, 0]];
+  dvar interval job[j in J] size dur[j];
+  dvar sequence mach in job types typ;
+  dexpr int setupCost = sum(j in J) cost[typ[j]][typeOfNext(mach, job[j], typ[j], typ[j])];
+  minimize staticLex(max(j in J) endOf(job[j]), setupCost);
+  subject to { noOverlap(mach, setup); EXTRA }`;
+
 describe('CP Optimizer scheduling', () => {
+  it('schedules sequences with setup times and typeOfNext (as brute force does)', () => {
+    const free = solve(SETUP.replace('EXTRA', ''));
+    assert.equal(free.info.objective, 19);
+    assert.equal(free.m.fieldValue('setupCost'), 16);
+    const ordered = solve(SETUP.replace('EXTRA', 'first(mach, job[3]); prev(mach, job[2], job[5]); before(mach, job[6], job[1]); last(mach, job[4]);'));
+    assert.equal(ordered.info.objective, 21);
+    assert.equal(ordered.m.fieldValue('setupCost'), 5);
+  });
+
+  it('supports alternative, span and synchronize', () => {
+    const alt = solve(`
+      using CP;
+      range J = 1..4; range M = 1..2;
+      int d[J] = [4, 3, 3, 2];
+      dvar interval job[j in J];
+      dvar interval mode[j in J][m in M] optional size d[j] * m;
+      minimize max(j in J) endOf(job[j]);
+      subject to {
+        forall(j in J) alternative(job[j], all(m in M) mode[j][m]);
+        forall(m in M) noOverlap(all(j in J) mode[j][m]);
+      }`);
+    assert.equal(alt.info.objective, 8);
+    const span = solve(`
+      using CP;
+      dvar interval a size 3; dvar interval b size 4; dvar interval c optional size 10;
+      dvar interval all;
+      minimize endOf(all);
+      subject to { span(all, [a, b, c]); endBeforeStart(a, b); startOf(a) >= 2; synchronize(b, [c]); }`);
+    assert.equal(span.info.objective, 9);
+    assert.equal((span.m.getField('c')!.value as Activity).presence!.value, 0);
+  });
+
+  it('follows calendars: intensity, forbidExtent, breakable activities and transition times', () => {
+    const cal = solve(`
+      using CP;
+      stepFunction workdays = stepwise { 100 -> 5; 0 -> 7; 100 -> 12; 0 -> 14; 100 };
+      dvar interval t size 6 intensity workdays;
+      dvar interval u size 2;
+      minimize endOf(u);
+      subject to { startOf(t) == 3; forbidExtent(u, workdays); endBeforeStart(t, u); }`);
+    assert.equal((cal.m.getField('t')!.value as Activity).end.value, 11);
+    assert.equal(cal.info.objective, 16);
+    const brk = solve(`
+      scheduleHorizon = 60;
+      Activity a(8) breakable;
+      Activity b(4);
+      UnaryResource m;
+      minimize b.end
+      subject to { addPeriodicBreak(m, 5, 2, 7, 60); a requires m; b requires m; a precedes b; };`);
+    assert.equal((brk.m.getField('a')!.value as Activity).end.value, 10);
+    assert.equal(brk.info.objective, 18);
+    const trans = solve(`
+      enum Colours { red, blue };
+      int setupTime[Colours, Colours] = [[0, 5], [5, 0]];
+      scheduleHorizon = 100;
+      Activity p1(3) transitionType red;
+      Activity p2(3) transitionType blue;
+      Activity p3(3) transitionType red;
+      UnaryResource press(setupTime);
+      var int makespan in 0..100;
+      minimize makespan
+      subject to { p1 requires press; p2 requires press; p3 requires press; p1.end <= makespan; p2.end <= makespan; p3.end <= makespan; };`);
+    assert.equal(trans.info.objective, 14);
+  });
+
   it('proves the ft06 job shop optimum (55) with interval variables', () => {
     const src = fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'web', 'examples', 'jobshop.mod'), 'utf8');
     const { info } = solve(src, { timeLimit: 30 });

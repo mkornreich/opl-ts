@@ -15,7 +15,7 @@ import { IlogRuntime } from './ilog.js';
 import { clampBounds } from './cp/builder.js';
 import { linearize, type QuadTerm } from './cp/linearize.js';
 import { solveCP } from './cp/search.js';
-import { Activity, CP_MAXINT, CPConstraint, Flattener, Resource, type CPCons, type CPDef, type CPHooks } from './cp/terms.js';
+import { Activity, CP_MAXINT, CPConstraint, Flattener, Resource, Sequence, StepFunction, type CPCons, type CPDef, type CPHooks } from './cp/terms.js';
 import { DBConnection } from './db.js';
 import { fail, type SourcePos } from './errors.js';
 import { DExpr, dvarValue, Evaluator, MAXINT, Predicate, Scope } from './eval.js';
@@ -27,6 +27,7 @@ import { SheetConnection } from './sheet.js';
 import { solveMIP } from './solver/mip.js';
 import type { LinearProgram, MIPStatus } from './solver/lp.js';
 import { toLpFormat } from './solver/lpformat.js';
+import { quadraticSupport, solveQuadratic, type Product } from './solver/global.js';
 import { isConvex, solveMIQP, type Hessian } from './solver/qp.js';
 import { clean } from './solver/simplex.js';
 import {
@@ -62,7 +63,7 @@ export type SolveStatus = MIPStatus | 'none';
 
 export interface SolveInfo {
   status: SolveStatus;
-  solver: 'LP' | 'MIP' | 'QP' | 'MIQP' | 'CP';
+  solver: 'LP' | 'MIP' | 'QP' | 'MIQP' | 'QCP' | 'MIQCP' | 'CP';
   sense: 'minimize' | 'maximize' | null;
   objective: number;
   objectiveType: Type;
@@ -105,8 +106,10 @@ export class ModelInstance implements HostObject {
   private varNames: string[] = [];
   private decision: DVar[] = [];
   private rows: GeneratedRow[] = [];
-  /** Products z = x * y of a quadratic objective (z is a placeholder column). */
+  /** Products z = x * y of a quadratic objective or quadratic rows (z is a placeholder column). */
   private quad: QuadTerm[] = [];
+  /** The products appear in rows or make the objective non-convex: the global solver. */
+  private quadGlobal = false;
   private cpCons: CPCons[] = [];
   private cpDefs: CPDef[] = [];
   private cpRefs: ConstraintRef[] = [];
@@ -240,7 +243,7 @@ export class ModelInstance implements HostObject {
 
   /** True for variables, dexprs and other model elements that exist only after generation. */
   isGeneratedElement(name: string): boolean {
-    return this.pre.some((st) => (st.k === 'var' || st.k === 'dexpr' || st.k === 'activity' || st.k === 'resource' || st.k === 'constraintDecl') && st.name === name);
+    return this.pre.some((st) => (st.k === 'var' || st.k === 'dexpr' || st.k === 'activity' || st.k === 'resource' || st.k === 'sequence' || st.k === 'constraintDecl') && st.name === name);
   }
 
   get hasMain(): boolean {
@@ -498,6 +501,7 @@ export class ModelInstance implements HostObject {
       case 'constraintDecl':
       case 'activity':
       case 'resource':
+      case 'sequence':
         if (ev.phase === 'post') fail('decision variables, activities and resources must be declared before the objective', st.pos);
         return;
       case 'objective':
@@ -604,6 +608,7 @@ export class ModelInstance implements HostObject {
     this.cpCons = [];
     this.cpDefs = [];
     this.quad = [];
+    this.quadGlobal = false;
     this.cpRefs = [];
     this.activities = [];
     this.selections = new Map();
@@ -624,8 +629,10 @@ export class ModelInstance implements HostObject {
           this.global.define(st.name, { value, type: arrayType({ k: 'constraint' }, sets) });
         } else if (st.k === 'activity') this.declareActivity(st);
         else if (st.k === 'resource') this.declareResource(st);
+        else if (st.k === 'sequence') this.declareSequence(st);
       }
       if (this.objective) this.walk(this.objective.constraints, this.global);
+      this.finishScheduling();
       for (const [name, entries] of this.labels) {
         this.global.define(name, { value: labelArray(entries, 0), type: { k: 'unknown' } });
       }
@@ -670,7 +677,7 @@ export class ModelInstance implements HostObject {
     }
   }
 
-  private linearProgram(obj: LinExpr): LinearProgram {
+  private linearProgram(obj: LinExpr, quadraticExport = false): LinearProgram {
     const n = this.vars.length;
     const sign = this.objective?.sense === 'maximize' ? -1 : 1;
     const lp: LinearProgram = {
@@ -683,9 +690,14 @@ export class ModelInstance implements HostObject {
       rows: [],
     };
     for (const [id, c] of obj.terms) lp.objective[id] += sign * c;
-    // Products of a quadratic objective: the Hessian holds them, their linear parts go here.
-    if (this.quad.length) {
-      // (the placeholder columns themselves are pinned at 0; their values are set after solving)
+    this.vars.forEach((v, j) => {
+      lp.lower[j] = v.lb;
+      lp.upper[j] = v.ub;
+      lp.integer[j] = v.isInt ? 1 : 0;
+    });
+    // Products of a convex quadratic objective: the Hessian holds them, their linear parts go here
+    // (the placeholder columns are pinned at 0; their values are set after solving).
+    if (this.quad.length && (!this.quadGlobal || quadraticExport)) {
       for (const { z } of this.quad) {
         lp.objective[z.id] = 0;
         lp.lower[z.id] = lp.upper[z.id] = 0;
@@ -694,11 +706,6 @@ export class ModelInstance implements HostObject {
       for (const [id, c] of q.linear) lp.objective[id] += c;
       lp.objConstant += q.constant;
     }
-    this.vars.forEach((v, j) => {
-      lp.lower[j] = v.lb;
-      lp.upper[j] = v.ub;
-      lp.integer[j] = v.isInt ? 1 : 0;
-    });
     for (const row of this.rows) {
       const index: number[] = [];
       const value: number[] = [];
@@ -798,7 +805,8 @@ export class ModelInstance implements HostObject {
         lo = d.lo;
         hi = Math.min(hi, d.hi);
       }
-      let dur: DVar | number = 0;
+      // Without `size`, the size is free (CP Optimizer).
+      let dur: DVar | number = spec.size ? 0 : flat.h.newVar(0, hi - lo, true, `${name}.size`);
       if (spec.size) {
         if (spec.size.k === 'range') {
           const a = ev.num(spec.size.lo, scope);
@@ -820,14 +828,127 @@ export class ModelInstance implements HostObject {
         this.vars.push(presence);
         this.decision.push(presence);
       }
-      this.cpDefs.push({ k: 'post', cons: { k: 'cmp', op: '=', l: end, r: LinExpr.of(start).clone().addScaled(dur, 1) } });
       const act = new Activity(name, start, end, dur, false, presence);
+      if (spec.intensity) {
+        // The size counts work at the intensity: end = the time when it is done.
+        const f = ev.eval(spec.intensity, scope);
+        if (!(f instanceof StepFunction)) fail('intensity needs a stepFunction', spec.intensity.pos);
+        const size = typeof dur === 'number' ? dur : dur.lb === dur.ub ? dur.lb : fail('an interval with an intensity needs a fixed size', spec.intensity.pos);
+        act.intensity = f;
+        this.cpDefs.push({ k: 'calendar', start, end, size, f });
+      } else {
+        this.cpDefs.push({ k: 'post', cons: { k: 'cmp', op: '=', l: end, r: LinExpr.of(start).clone().addScaled(dur, 1) } });
+      }
       this.activities.push(act);
       return act;
     };
     const value = st.dims.length ? ev.buildArray(st.dims, sets, this.global, make) : make(this.global, []);
     this.global.define(st.name, { value, type: arrayType(UNKNOWN, sets) });
     this.varNames.push(st.name);
+  }
+
+  /** The ordinal of an enum value (transition and sequence types). */
+  private enumOrdinal(v: string, pos: SourcePos): number {
+    for (const st of this.ast.stmts) {
+      if (st.k !== 'enum') continue;
+      const e = this.global.lookup(st.name)?.value;
+      if (e instanceof EnumType && e.indexOf(v) >= 0) return e.indexOf(v);
+    }
+    fail(`${v} is not an enum value`, pos);
+  }
+
+  private declareSequence(st: Extract<Stmt, { k: 'sequence' }>): void {
+    const ev = this.ev;
+    this.usesCP = true;
+    const sets = ev.indexSets(st.dims, this.global);
+    const make = (scope: Scope, p: Value[]): Sequence => {
+      const leaves = (v: Value): Value[] => (v instanceof OplArray || v instanceof RawArray ? v.items.flatMap(leaves) : [v]);
+      const acts = leaves(ev.eval(st.intervals, scope)).map((a) => (a instanceof Activity ? a : fail('a sequence holds interval variables', st.intervals.pos)));
+      let types = acts.map(() => 0);
+      if (st.types) {
+        const ts = leaves(ev.eval(st.types, scope));
+        if (ts.length !== acts.length) fail(`a sequence of ${acts.length} intervals needs ${acts.length} types, not ${ts.length}`, st.types.pos);
+        types = ts.map((t) => (typeof t === 'number' ? t : typeof t === 'string' ? this.enumOrdinal(t, st.pos) : fail('sequence types must be integers', st.types!.pos)));
+      }
+      return new Sequence(st.name + keyPath(p), acts, types);
+    };
+    const value = st.dims.length ? ev.buildArray(st.dims, sets, this.global, make) : make(this.global, []);
+    this.global.define(st.name, { value, type: { k: 'host' } });
+  }
+
+  /**
+   * After the constraints: transition times on OPL 3 unary resources, and
+   * the breaks of resources (breakable activities run around them, others
+   * must not overlap them).
+   */
+  private finishScheduling(): void {
+    if (!this.activities.length) return;
+    const uses = new Map<Resource, { act: Activity; presence: DVar | null }[]>();
+    const walk = (c: unknown): void => {
+      if (!c || typeof c !== 'object') return;
+      if (Array.isArray(c)) return c.forEach(walk);
+      const o = c as Record<string, unknown>;
+      if (o.k === 'uses' && o.act instanceof Activity && o.res instanceof Resource) {
+        if (!uses.has(o.res)) uses.set(o.res, []);
+        uses.get(o.res)!.push({ act: o.act, presence: o.presence instanceof DVar ? o.presence : null });
+        return;
+      }
+      if (typeof o.k === 'string') for (const v of Object.values(o)) if (v && typeof v === 'object' && !(v instanceof DVar) && !(v instanceof LinExpr)) walk(v);
+    };
+    walk(this.cpCons);
+    const present = (p: DVar | null): CPCons => (p ? { k: 'cmp', op: '=', l: p, r: 1 } : { k: 'const', value: true });
+    for (const [res, list] of uses) {
+      if (!res.transitions || !res.transitionKeys) continue;
+      const row = (a: Activity) => {
+        const k = res.transitionKeys!.indexOf(a.transitionType ?? 0);
+        if (k < 0) fail(`activity ${a.name} has no transition type in the table of ${res.name}`);
+        return k;
+      };
+      for (let i = 0; i < list.length; i++) {
+        for (let j = i + 1; j < list.length; j++) {
+          const [a, b] = [list[i], list[j]];
+          const ab = res.transitions[row(a.act)][row(b.act)];
+          const ba = res.transitions[row(b.act)][row(a.act)];
+          if (!ab && !ba) continue;
+          const order: CPCons = {
+            k: 'or',
+            a: { k: 'cmp', op: '<=', l: LinExpr.of(a.act.end).clone().addScaled(1, ab), r: b.act.start },
+            b: { k: 'cmp', op: '<=', l: LinExpr.of(b.act.end).clone().addScaled(1, ba), r: a.act.start },
+          };
+          this.cpCons.push({ k: 'imp', a: { k: 'and', a: present(a.presence), b: present(b.presence) }, b: order });
+        }
+      }
+    }
+    // Breaks, per activity: the union over the resources it requires.
+    const breaksOf = new Map<Activity, [number, number][]>();
+    for (const [res, list] of uses) {
+      if (!res.breaks.length) continue;
+      for (const { act, presence } of list) {
+        if (presence && presence !== act.presence) fail(`breaks on ${res.name}, one of alternative resources, are not supported`);
+        breaksOf.set(act, [...(breaksOf.get(act) ?? []), ...res.breaks]);
+      }
+    }
+    for (const act of this.activities) {
+      const breaks = (breaksOf.get(act) ?? []).sort((x, y) => x[0] - y[0]);
+      if (act.breakable) {
+        if (!breaks.length) {
+          this.cpCons.push({ k: 'cmp', op: '=', l: act.end, r: LinExpr.of(act.start).clone().addScaled(act.duration, 1) });
+          continue;
+        }
+        const size = typeof act.duration === 'number' ? act.duration : act.duration.lb === act.duration.ub ? act.duration.lb : fail(`breakable activity ${act.name} needs a fixed duration`);
+        act.intensity = workCalendar(breaks);
+        this.cpDefs.push({ k: 'calendar', start: act.start, end: act.end, size, f: act.intensity });
+        continue;
+      }
+      // Not breakable: entirely before or after each break.
+      for (const [from, to] of breaks) {
+        this.cpCons.push({
+          k: 'imp',
+          a: present(act.presence),
+          b: { k: 'or', a: { k: 'cmp', op: '<=', l: act.end, r: from }, b: { k: 'cmp', op: '>=', l: act.start, r: to } },
+        });
+      }
+    }
   }
 
   /** `in lo..hi` (int or float bounds) or `in S` (a set of values). */
@@ -877,8 +998,14 @@ export class ModelInstance implements HostObject {
       const end = new DVar(this.vars.length, `${name}.end`, true, this.origin + dlo, horizon);
       this.vars.push(end);
       start.aux = end.aux = true;
-      this.cpDefs.push({ k: 'post', cons: { k: 'cmp', op: '=', l: end, r: LinExpr.of(start).clone().addScaled(dur, 1) } });
       const act = new Activity(name, start, end, dur, st.breakable);
+      // A breakable activity's end depends on the breaks of its resources (finishScheduling).
+      if (st.breakable) this.cpDefs.push({ k: 'post', cons: { k: 'cmp', op: '>=', l: end, r: LinExpr.of(start).clone().addScaled(dur, 1) } });
+      else this.cpDefs.push({ k: 'post', cons: { k: 'cmp', op: '=', l: end, r: LinExpr.of(start).clone().addScaled(dur, 1) } });
+      if (st.transitionType) {
+        const t = ev.eval(st.transitionType, scope);
+        act.transitionType = typeof t === 'number' ? t : typeof t === 'string' ? this.enumOrdinal(t, st.transitionType.pos) : fail('transitionType must be an integer or an enum value', st.transitionType.pos);
+      }
       this.activities.push(act);
       return act;
     };
@@ -901,8 +1028,19 @@ export class ModelInstance implements HostObject {
         return v;
       };
       switch (st.kind) {
-        case 'UnaryResource':
-          return new Resource(name, 'unary', 1, 0);
+        case 'UnaryResource': {
+          // UnaryResource r(times): transition times between transition types.
+          const tt = args[0];
+          if (tt === undefined) return new Resource(name, 'unary', 1, 0);
+          if (!(tt instanceof OplArray) || !tt.items.every((row) => row instanceof OplArray)) {
+            fail('UnaryResource takes a two-dimensional array of transition times', st.pos);
+          }
+          const keys = tt.index instanceof EnumType ? tt.index.values.map((_, k) => k) : elementsOf(tt.index as Value)!.map((k) => (typeof k === 'number' ? k : this.enumOrdinal(String(k), st.pos)));
+          const times = tt.items.map((row) => (row as OplArray).items.map((v) => (typeof v === 'number' ? v : fail('transition times must be numbers', st.pos))));
+          const r = new Resource(name, 'unary', 1, 0, [], null, times);
+          r.transitionKeys = keys;
+          return r;
+        }
         case 'DiscreteResource':
           return new Resource(name, 'discrete', num(0, 1), 0);
         case 'Reservoir':
@@ -1082,13 +1220,27 @@ export class ModelInstance implements HostObject {
       newVar: (lo, hi, isInt, name) => hooks.newVar(lo, hi, isInt, name),
       quadratic,
     });
-    // A non-convex quadratic objective stays with the CP solver.
-    if (!extra || (quadratic.length && !isConvex(this.quadraticPart(obj, quadratic).h))) {
+    if (!extra) {
       this.vars.length = before;
       return;
     }
+    const rowsBefore = this.rows.length;
     this.rows.push(...extra);
     this.quad = quadratic;
+    if (quadratic.length) {
+      // Products in rows, or a non-convex objective, need the global solver;
+      // when it cannot relax the model (unbounded non-convex terms), CP keeps it.
+      const zs = new Set(quadratic.map((q) => q.z.id));
+      const inRows = this.rows.some((r) => [...r.expr.terms].some(([id, c]) => c !== 0 && zs.has(id)));
+      this.quadGlobal = inRows || !isConvex(this.quadraticPart(obj, quadratic).h);
+      if (this.quadGlobal && quadraticSupport(this.linearProgram(obj), this.products()) !== null) {
+        this.rows.length = rowsBefore;
+        this.vars.length = before;
+        this.quad = [];
+        this.quadGlobal = false;
+        return;
+      }
+    }
     this.cpDefs = [];
     this.cpCons = [];
     this.usesCP = false;
@@ -1129,6 +1281,41 @@ export class ModelInstance implements HostObject {
     if (d === undefined) return own;
     const left = Math.max(0.001, (d - performance.now()) / 1000);
     return own === undefined ? left : Math.min(own, left);
+  }
+
+  /** Products as the global solver wants them: z = sum(c x_i x_j) + sum(c x_j) + constant. */
+  private products(): Product[] {
+    return this.quad.map(({ z, a, b }) => {
+      const terms = new Map<string, { i: number; j: number; c: number }>();
+      for (const [i, ci] of a.terms) {
+        for (const [j, cj] of b.terms) {
+          if (ci * cj === 0) continue;
+          const key = `${Math.min(i, j)},${Math.max(i, j)}`;
+          const t = terms.get(key) ?? { i: Math.min(i, j), j: Math.max(i, j), c: 0 };
+          t.c += ci * cj;
+          terms.set(key, t);
+        }
+      }
+      const linear = new Map<number, number>();
+      if (b.constant) for (const [i, ci] of a.terms) linear.set(i, (linear.get(i) ?? 0) + ci * b.constant);
+      if (a.constant) for (const [j, cj] of b.terms) linear.set(j, (linear.get(j) ?? 0) + cj * a.constant);
+      return {
+        z: z.id,
+        terms: [...terms.values()].filter((t) => t.c !== 0),
+        linear: [...linear].map(([j, c]) => ({ j, c })),
+        constant: a.constant * b.constant,
+      };
+    });
+  }
+
+  private solverKind(integer: boolean, convexQP: boolean): SolveInfo['solver'] {
+    if (this.quadGlobal) {
+      const zs = new Set(this.quad.map((q) => q.z.id));
+      const qcp = this.rows.some((r) => [...r.expr.terms].some(([id, c]) => c !== 0 && zs.has(id)));
+      return qcp ? (integer ? 'MIQCP' : 'QCP') : integer ? 'MIQP' : 'QP';
+    }
+    if (convexQP) return integer ? 'MIQP' : 'QP';
+    return integer ? 'MIP' : 'LP';
   }
 
   /**
@@ -1172,10 +1359,12 @@ export class ModelInstance implements HostObject {
     if (this.relaxed) lp.integer.fill(0);
     const sense = this.objective?.sense ?? null;
     const t0 = performance.now();
-    const h = this.quad.length ? this.quadraticPart(obj, this.quad).h : null;
-    const res = h
-      ? solveMIQP(lp, h, { timeLimit: this.solveSeconds() })
-      : solveMIP(lp, { nodeSelection: this.options.nodeSelection, timeLimit: this.solveSeconds() });
+    const h = this.quad.length && !this.quadGlobal ? this.quadraticPart(obj, this.quad).h : null;
+    const res = this.quadGlobal
+      ? solveQuadratic(lp, this.products(), { timeLimit: this.solveSeconds() })
+      : h
+        ? solveMIQP(lp, h, { timeLimit: this.solveSeconds() })
+        : solveMIP(lp, { nodeSelection: this.options.nodeSelection, timeLimit: this.solveSeconds() });
     const time = (performance.now() - t0) / 1000;
     const sign = sense === 'maximize' ? -1 : 1;
     const ok = res.status === 'optimal' || res.status === 'feasible';
@@ -1202,7 +1391,7 @@ export class ModelInstance implements HostObject {
     const numIntVars = lp.integer.reduce((a, b) => a + b, 0);
     this.lastSolve = {
       status: this.objective ? res.status : 'none',
-      solver: h ? (numIntVars > 0 ? 'MIQP' : 'QP') : numIntVars > 0 ? 'MIP' : 'LP',
+      solver: this.solverKind(numIntVars > 0, h !== null),
       sense,
       objective: ok ? clean(sign * res.objective) + 0 : NaN,
       objectiveType: this.objectiveType(),
@@ -1342,11 +1531,41 @@ export class ModelInstance implements HostObject {
     const obj = this.objectiveExpr();
     this.tryLinearize(obj);
     if (this.usesCP) fail('this model uses constraint programming and has no LP form');
-    const lp = this.linearProgram(obj);
+    const lp = this.linearProgram(obj, true);
     const rowNames = this.rows.map((r, i) => r.ref?.name ?? `c${i + 1}`);
     const title = `generated by opl-ts from ${path.basename(this.ast.file)}`;
     const h = this.quad.length ? this.quadraticPart(obj, this.quad).h : null;
-    return toLpFormat(lp, this.objective?.sense === 'maximize', this.vars.map((v) => v.name), rowNames, title, h);
+    // Rows with products: the products expanded into linear and quadratic parts.
+    const rowQuad: (Hessian | null)[] = [];
+    if (this.quadGlobal) {
+      const products = new Map(this.products().map((p) => [p.z, p]));
+      lp.rows.forEach((row, i) => {
+        if (!row.index.some((j) => products.has(j))) return;
+        const lin = new Map<number, number>();
+        const quad = new Map<string, number>();
+        let k = 0;
+        row.index.forEach((j, t) => {
+          const c = row.value[t];
+          const p = products.get(j);
+          if (!p) return lin.set(j, (lin.get(j) ?? 0) + c);
+          k += c * p.constant;
+          for (const l of p.linear) lin.set(l.j, (lin.get(l.j) ?? 0) + c * l.c);
+          for (const q of p.terms) quad.set(`${q.i},${q.j}`, (quad.get(`${q.i},${q.j}`) ?? 0) + c * q.c);
+        });
+        const entries = [...lin].filter(([, c]) => c !== 0);
+        lp.rows[i] = { index: entries.map(([j]) => j), value: entries.map(([, c]) => c), lower: row.lower - k, upper: row.upper - k };
+        const hq: Hessian = { i: [], j: [], v: [] };
+        for (const [key, c] of quad) {
+          if (c === 0) continue;
+          const [a, b] = key.split(',').map(Number);
+          hq.i.push(a);
+          hq.j.push(b);
+          hq.v.push(c);
+        }
+        rowQuad[i] = hq;
+      });
+    }
+    return toLpFormat(lp, this.objective?.sense === 'maximize', this.vars.map((v) => v.name), rowNames, title, h, rowQuad);
   }
 
   get solved(): boolean {
@@ -1502,4 +1721,21 @@ function leaves(v: Value): Value[] {
 
 function indexKeyType(set: OplArray['index']): Type {
   return set instanceof OplSet && set.elemType ? set.elemType : UNKNOWN;
+}
+
+/** 100% intensity except 0 during the breaks (merged). */
+function workCalendar(breaks: [number, number][]): StepFunction {
+  const merged: [number, number][] = [];
+  for (const [a, b] of breaks) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  const values: number[] = [100];
+  const points: number[] = [];
+  for (const [a, b] of merged) {
+    points.push(a, b);
+    values.push(0, 100);
+  }
+  return new StepFunction(values, points);
 }

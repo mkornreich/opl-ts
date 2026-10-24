@@ -61,6 +61,8 @@ export function printExpr(e: Expr, subst: (name: string) => string | null = () =
         return `#<${x.fields.map((f) => `${f.name}: ${p(f.value)}`).join(', ')}>#`;
       case 'cond':
         return wrap(`${p(x.c, 1)} ? ${p(x.a)} : ${p(x.b)}`, 0, ctx);
+      case 'stepwise':
+        return `stepwise{${x.items.map((it) => `${p(it.slope)} -> ${p(it.bp)}; `).join('')}${p(x.last)}}`;
       case 'piecewise':
         return `piecewise{${x.items.map((it) => `${p(it.slope)} -> ${p(it.bp)}; `).join('')}${p(x.last)}}${x.operand ? ` ${p(x.operand, 8)}` : ''}`;
     }

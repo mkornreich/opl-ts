@@ -259,6 +259,12 @@ class Parser {
     }
     if (t.kind === 'ident') {
       if (t.text === 'piecewise' && (this.isPunct('{', 1) || this.isPunct('(', 1))) return this.parsePiecewise();
+      if (t.text === 'stepwise' && (this.isPunct('{', 1) || this.isPunct('(', 1))) {
+        // stepwise{ v1 -> x1; v2 -> x2; ...; vn }: the same shape as piecewise.
+        const e = this.parsePiecewise();
+        if (e.k !== 'piecewise' || e.origin || e.operand) this.unexpected('stepwise{ value -> point; ...; last value }');
+        return { k: 'stepwise', q: e.q, items: e.items, last: e.last, pos: e.pos };
+      }
       if (AGGREGATES.has(t.text) && this.isPunct('(', 1) &&
           (t.text === 'sum' || t.text === 'prod' || this.binderFollows(2))) {
         this.next();
@@ -592,6 +598,7 @@ class Parser {
           this.next();
           const modern = t.text === 'dvar';
           if (this.acceptIdent('interval')) return this.parseIntervalVars(modern);
+          if (this.acceptIdent('sequence')) return this.parseSequenceVars();
           const type = this.parseType();
           const out: Stmt[] = [];
           do {
@@ -752,8 +759,14 @@ class Parser {
               duration = this.parseExpr();
               this.expectPunct(')');
             }
-            const breakable = this.acceptIdent('breakable');
-            out.push({ k: 'activity', name, dims, duration, breakable, pos: apos });
+            let breakable = false;
+            let transitionType: Expr | null = null;
+            for (;;) {
+              if (this.acceptIdent('breakable')) breakable = true;
+              else if (this.acceptIdent('transitionType')) transitionType = this.parseExpr();
+              else break;
+            }
+            out.push({ k: 'activity', name, dims, duration, breakable, transitionType, pos: apos });
           } while (this.acceptPunct(','));
           this.expectPunct(';');
           return out;
@@ -826,14 +839,30 @@ class Parser {
     return [this.parseDataDecl()];
   }
 
-  /** dvar interval a[dims] [optional] [in lo..hi] [size s]; */
+  /** dvar sequence s[dims] in intervals [types t]; */
+  private parseSequenceVars(): Stmt[] {
+    const out: Stmt[] = [];
+    do {
+      const pos = this.pos;
+      const name = this.expectIdent().text;
+      const dims = this.parseDims();
+      if (!this.acceptIdent('in')) this.unexpected("'in' and the intervals of the sequence");
+      const intervals = this.parseExpr();
+      const types = this.acceptIdent('types') ? this.parseExpr() : null;
+      out.push({ k: 'sequence', name, dims, intervals, types, pos });
+    } while (this.acceptPunct(','));
+    this.expectPunct(';');
+    return out;
+  }
+
+  /** dvar interval a[dims] [optional] [in lo..hi] [size s] [intensity F]; */
   private parseIntervalVars(modern: boolean): Stmt[] {
     const out: Stmt[] = [];
     do {
       const pos = this.pos;
       const name = this.expectIdent().text;
       const dims = this.parseDims();
-      const spec = { optional: false, window: null as Expr | null, size: null as Expr | null };
+      const spec = { optional: false, window: null as Expr | null, size: null as Expr | null, intensity: null as Expr | null };
       for (;;) {
         if (this.acceptIdent('optional')) {
           if (this.acceptPunct('(')) {
@@ -843,10 +872,8 @@ class Parser {
           spec.optional = true;
         } else if (this.acceptIdent('in')) spec.window = this.parseRange();
         else if (this.acceptIdent('size')) spec.size = this.parseRange();
-        else if (this.isIdent('intensity')) {
-          this.next();
-          this.parseRange();
-        } else break;
+        else if (this.acceptIdent('intensity')) spec.intensity = this.parseExpr();
+        else break;
       }
       out.push({ k: 'var', type: { k: 'int', nonneg: true }, name, dims, domain: null, modern, interval: spec, pos });
     } while (this.acceptPunct(','));

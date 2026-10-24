@@ -20,6 +20,10 @@ export const CP_FLOAT_BOUND = 1e9;
 export type CmpOp = '<=' | '<' | '>=' | '>' | '=' | '!=';
 
 export class Activity {
+  /** OPL 3 `transitionType t`: indexes the transition times of unary resources. */
+  transitionType: number | null = null;
+  /** CP Optimizer `intensity F`: the size counts work F(t)/100 per time unit. */
+  intensity: StepFunction | null = null;
   constructor(
     readonly name: string,
     readonly start: DVar,
@@ -28,6 +32,76 @@ export class Activity {
     readonly breakable: boolean,
     /** Optional interval variables (CP Optimizer): 0/1 presence. */
     readonly presence: DVar | null = null,
+  ) {}
+}
+
+/**
+ * A step function: values[0] before points[0], values[k] on
+ * [points[k-1], points[k]), the last value after the last point.
+ */
+export class StepFunction {
+  constructor(
+    readonly values: number[],
+    readonly points: number[],
+  ) {}
+
+  valueAt(t: number): number {
+    let k = 0;
+    while (k < this.points.length && t >= this.points[k]) k++;
+    return this.values[k];
+  }
+
+  /** Work (sum of values per unit) on [0, t) for t >= 0. */
+  work(t: number): number {
+    let w = 0;
+    let at = 0;
+    for (let k = 0; k <= this.points.length && at < t; k++) {
+      const to = k < this.points.length ? Math.min(this.points[k], t) : t;
+      if (to > at) {
+        w += this.values[k] * (to - at);
+        at = to;
+      }
+    }
+    return w;
+  }
+
+  /** The earliest end e >= s with work(e) - work(s) >= amount (Infinity when never). */
+  endFrom(s: number, amount: number): number {
+    if (amount <= 0) return s;
+    let need = amount;
+    let at = s;
+    for (let k = 0; k <= this.points.length; k++) {
+      const segEnd = k < this.points.length ? this.points[k] : Infinity;
+      if (segEnd <= at) continue;
+      const v = this.values[k];
+      if (v > 0) {
+        const len = Math.ceil(need / v - 1e-9);
+        if (at + len <= segEnd) return at + len;
+        need -= v * (segEnd - at);
+      }
+      if (!isFinite(segEnd)) return Infinity;
+      at = segEnd;
+    }
+    return Infinity;
+  }
+
+  /** Zero-valued segments as [from, to) (to may be Infinity). */
+  zeros(): [number, number][] {
+    const out: [number, number][] = [];
+    for (let k = 0; k <= this.points.length; k++) {
+      if (this.values[k] !== 0) continue;
+      out.push([k === 0 ? -Infinity : this.points[k - 1], k < this.points.length ? this.points[k] : Infinity]);
+    }
+    return out;
+  }
+}
+
+/** A CP Optimizer sequence variable: intervals and their integer types. */
+export class Sequence {
+  constructor(
+    readonly name: string,
+    readonly acts: Activity[],
+    readonly types: number[],
   ) {}
 }
 
@@ -43,7 +117,13 @@ export class Resource {
     readonly members: Resource[] = [],
     /** States of a StateResource (enum values are mapped to their ordinal). */
     readonly states: string[] | null = null,
+    /** Transition times of a unary resource: times[type of a][type of b] between a and a later b. */
+    readonly transitions: number[][] | null = null,
   ) {}
+  /** Breaks [from, to): the resource does not work then (OPL 3 addBreak / addPeriodicBreak). */
+  readonly breaks: [number, number][] = [];
+  /** The transition types indexing the rows and columns of transitions. */
+  transitionKeys: number[] | null = null;
 }
 
 export type CPCons =
@@ -72,7 +152,9 @@ export type CPDef =
   | { k: 'element'; z: DVar; idx: DVar; keys: number[]; items: (DVar | number)[] }
   | { k: 'reify'; b: DVar; cons: CPCons }
   | { k: 'linear'; z: DVar; e: LinExpr }
-  | { k: 'post'; cons: CPCons };
+  | { k: 'post'; cons: CPCons }
+  /** end = the earliest time when `size` units of work (f, in percent) have been done since start. */
+  | { k: 'calendar'; start: DVar; end: DVar; size: number; f: StepFunction };
 
 /** What the evaluator needs from the model (generation) or the live search. */
 export interface CPHooks {

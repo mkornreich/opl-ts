@@ -6,7 +6,7 @@ import { fail } from '../errors.js';
 import { DVar, LinExpr, type Linear } from '../linear.js';
 import { Dom } from './domain.js';
 import {
-  Abs, AllDifferent, Circuit, Distribute, Div, Element, Linear as LinearProp, LinearNe, MinMax, Mod, Monotone,
+  Calendar, Abs, AllDifferent, Circuit, Distribute, Div, Element, Linear as LinearProp, LinearNe, MinMax, Mod, Monotone,
   ReifLinear, ReifMember, Table, Times, type LinKind,
 } from './propagators.js';
 import { Cumulative, Disjunctive, Reservoir, type Task } from './sched.js';
@@ -334,16 +334,21 @@ export class CPBuilder {
       case 'post':
         this.post(def.cons);
         return;
+      case 'calendar':
+        this.addProp(new Calendar(v(def.start), v(def.end), def.size, def.f));
+        return;
     }
   }
 
   // ------------------------------------------------------------ scheduling
 
   task(act: Activity, presence: number, amount: Linear): Task {
+    // Calendar activities occupy [start, end), longer than their size.
+    const occupied = act.intensity || act.breakable ? LinExpr.of(act.end).clone().addScaled(act.start, -1) : act.duration;
     return {
       start: act.start.id,
       end: act.end.id,
-      dur: this.varOf(act.duration),
+      dur: this.varOf(occupied),
       presence,
       amount: this.varOf(amount),
       name: act.name,

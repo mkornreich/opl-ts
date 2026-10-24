@@ -200,8 +200,13 @@ export class Times implements Propagator {
       if (!this.divide(s, x, dz, s.dom(y)) || !this.divide(s, y, s.dom(z), s.dom(x))) return false;
     }
     if (!s.real[z] && s.isBound(z) && s.isBound(x) && s.value(x) !== 0) {
-      const q = s.value(z) / s.value(x);
-      if (!s.real[y] && !Number.isInteger(q)) return false;
+      let q = s.value(z) / s.value(x);
+      if (!s.real[y]) {
+        // 1 / 0.333... is 3.0000000000000004: integers within rounding.
+        const r = Math.round(q);
+        if (Math.abs(q - r) > 1e-9 * Math.max(1, Math.abs(q))) return false;
+        q = r;
+      }
       if (!s.assign(y, q)) return false;
     }
     return true;
@@ -682,5 +687,56 @@ export class Table implements Propagator {
       if (!s.remove(xs[free], t[free])) return false;
     }
     return true;
+  }
+}
+
+/**
+ * end = the earliest time at which `size` units of work are done since
+ * start, work accruing at f(t) percent per unit (CP Optimizer intensity,
+ * OPL 3 breakable activities).  end is a nondecreasing function of start.
+ */
+export class Calendar implements Propagator {
+  queued?: boolean;
+  readonly vars: number[];
+  constructor(
+    readonly start: number,
+    readonly end: number,
+    readonly size: number,
+    readonly f: import('./terms.js').StepFunction,
+  ) {
+    this.vars = [start, end];
+  }
+
+  propagate(s: Store): boolean {
+    const { start, end } = this;
+    const amount = this.size * 100;
+    const F = (t: number) => this.f.endFrom(t, amount);
+    const sMin = s.min(start);
+    const sMax = s.max(start);
+    const fMin = F(sMin);
+    if (!isFinite(fMin) || !s.setMin(end, fMin)) return false;
+    const fMax = F(sMax);
+    if (isFinite(fMax) && !s.setMax(end, fMax)) return false;
+    const eMin = s.min(end);
+    const eMax = s.max(end);
+    // The smallest start reaching eMin, the largest one not passing eMax.
+    let lo = sMin;
+    let hi = sMax;
+    if (F(hi) < eMin) return false;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (F(mid) >= eMin) hi = mid;
+      else lo = mid + 1;
+    }
+    if (!s.setMin(start, lo)) return false;
+    lo = s.min(start);
+    hi = sMax;
+    if (F(lo) > eMax) return false;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (F(mid) <= eMax) lo = mid;
+      else hi = mid - 1;
+    }
+    return s.setMax(start, lo);
   }
 }

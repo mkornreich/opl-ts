@@ -3,6 +3,8 @@
  * trail for backtracking.
  */
 
+import { memoryExceeded } from '../solver/memory.js';
+
 import { Dom } from './domain.js';
 
 export interface Propagator {
@@ -87,14 +89,30 @@ export class Store {
     this.queue.push(p);
   }
 
+  /** performance.now() time limit of the search (checked during long fixpoints). */
+  deadline = Infinity;
+  /** Failures of the constraints on each variable (dom/wdeg). */
+  private readonly failWeight: number[] = [];
+
+  /** 1 + failures of the constraints on v (ties keep OPL's first-fail order until something fails). */
+  weight(v: number): number {
+    return 1 + (this.failWeight[v] ?? 0);
+  }
+
   /** Runs propagators to a fixpoint. */
   propagate(): boolean {
     if (this.objVar >= 0 && !this.setMax(this.objVar, this.objBound)) return this.failNow();
     while (this.qhead < this.queue.length) {
       const p = this.queue[this.qhead++];
       p.queued = false;
-      this.propagations++;
-      if (!p.propagate(this)) return this.failNow();
+      // Bounds that creep towards each other across a huge domain can take
+      // very long to fail; stop at the limits instead.
+      if ((++this.propagations & 0xffff) === 0 && (performance.now() > this.deadline || memoryExceeded())) throw new SearchLimit();
+      if (!p.propagate(this)) {
+        // dom/wdeg: variables of constraints that fail often are labelled earlier.
+        if (this.searching) for (const v of p.vars) this.failWeight[v] = (this.failWeight[v] ?? 0) + 1;
+        return this.failNow();
+      }
     }
     this.queue = [];
     this.qhead = 0;
@@ -181,3 +199,5 @@ export class Store {
   }
 }
 
+/** Thrown when propagation runs into the time or memory limit. */
+export class SearchLimit extends Error {}

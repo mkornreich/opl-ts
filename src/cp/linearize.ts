@@ -9,8 +9,8 @@
  * - meta-constraints and logical constraints (=>, or, not, !=) become
  *   indicator-style big-M rows.
  *
- * - other products of two variables whose result only appears in the
- *   objective are left to the QP solver (listed in input.quadratic).
+ * - other products of two variables (in the objective or in rows) are left
+ *   to the quadratic solvers (listed in input.quadratic).
  *
  * Returns null when something needs constraint programming (alldifferent,
  * scheduling, general products, unbounded big-M terms, ...).
@@ -115,10 +115,11 @@ class Linearizer {
     return this.inp.newVar(0, 1, true, name);
   }
 
-  /** How often each variable appears outside the objective and its own definition. */
+  /** How often each variable appears in non-linear definitions and constraints (rows and linear definitions excluded). */
   private uses: Map<number, number> | null = null;
 
-  private usedOutsideObjective(z: DVar): boolean {
+  /** Whether z is used by something other than rows, linear definitions and the objective. */
+  private usedNonLinearly(z: DVar): boolean {
     if (!this.uses) {
       const uses = new Map<number, number>();
       const count = (v: unknown, skip: DVar | null): void => {
@@ -132,8 +133,7 @@ class Linearizer {
           for (const x of Object.values(v)) count(x, skip);
         }
       };
-      for (const r of this.inp.rows) count(r.expr, null);
-      for (const d of this.inp.defs) count(d, 'z' in d ? d.z : null);
+      for (const d of this.inp.defs) if (d.k !== 'linear') count(d, 'z' in d ? d.z : null);
       for (const c of this.inp.cons) count(c, null);
       this.uses = uses;
     }
@@ -278,7 +278,7 @@ class Linearizer {
       this.row(this.lin(z).addScaled(x, -1).addScaled(y, -1), -1, Infinity);
       return;
     }
-    if (!this.isBinary(x) && !this.isBinary(y) && this.inp.quadratic && !this.usedOutsideObjective(z)) {
+    if (!this.isBinary(x) && !this.isBinary(y) && this.inp.quadratic && !this.usedNonLinearly(z)) {
       this.inp.quadratic.push({ z, a: this.expand(x), b: this.expand(y) });
       return;
     }
@@ -563,6 +563,8 @@ function refersTo(d: CPDef, id: number): boolean {
     case 'abs':
     case 'fn':
       return has(d.x);
+    case 'calendar':
+      return has(d.start) || has(d.end);
     default:
       return has(d.x) || has(d.y);
   }
