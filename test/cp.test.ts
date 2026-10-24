@@ -8,6 +8,7 @@ import { Activity } from '../src/cp/terms.js';
 import { DVar } from '../src/linear.js';
 import { ModelInstance, type ModelOptions } from '../src/model.js';
 import { parseModel, parseScript } from '../src/parser.js';
+import { runFile } from '../src/runner.js';
 import { ScriptRunner } from '../src/script.js';
 import { OplArray, type Value } from '../src/values.js';
 
@@ -394,6 +395,151 @@ describe('CP Optimizer scheduling', () => {
     const { info } = solve(src, { timeLimit: 30 });
     assert.equal(info.status, 'optimal');
     assert.equal(info.objective, 55);
+  });
+
+  it('runs every playground example', () => {
+    const dir = path.join(import.meta.dirname, '..', '..', 'web', 'examples');
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8')) as { examples: { main: string; files: string[]; data: string[] }[] };
+    for (const ex of manifest.examples) {
+      const main = ex.files.find((f) => f.endsWith(ex.main));
+      if (!main?.startsWith('web/examples/')) continue;
+      const root = path.join(import.meta.dirname, '..', '..');
+      const result = runFile(path.join(root, main), ex.data.map((d) => path.join(dir, d)), { write: () => {}, warn: () => {}, timeLimit: 30 });
+      if (result.solve) assert.ok(['optimal', 'feasible'].includes(result.solve.status), `${ex.main}: ${result.solve.status}`);
+    }
+  });
+});
+
+describe('CP Optimizer functions', () => {
+  it('orders sequences by rank, with transition distances between neighbours only for isDirect', () => {
+    const seq = (direct: string) => `
+      using CP;
+      tuple triplet { int s1; int s2; int d; };
+      {triplet} D = {<0, 1, 1>, <1, 2, 1>, <0, 2, 10>};
+      dvar interval a[1..3] size 1;
+      dvar sequence s in a types [0, 1, 2];
+      minimize max(i in 1..3) endOf(a[i]);
+      subject to { noOverlap(s, D${direct}); first(s, a[1]); last(s, a[3]); }`;
+    assert.equal(solve(seq(', true')).info.objective, 5);
+    assert.equal(solve(seq('')).info.objective, 12);
+    // Without noOverlap the order says nothing about time.
+    const free = solve(`
+      using CP;
+      dvar interval a[1..3] size 2;
+      dvar sequence s in a;
+      minimize max(i in 1..3) endOf(a[i]);
+      subject to { before(s, a[3], a[1]); prev(s, a[1], a[2]); }`);
+    assert.equal(free.info.objective, 2);
+  });
+
+  it('presolves integer programs (fixed columns, singleton rows)', () => {
+    const { info } = solve(`
+      dvar int x in 0..10; dvar int y in 0..10; dvar int z in 0..10;
+      maximize x + 2 * y + 3 * z;
+      subject to { x == 3; 2 * y <= 9; x + y + z <= 12; z <= 7.5; }`);
+    assert.equal(info.objective, 28);
+  });
+
+  it('bounds cumul functions: steps, variable heights, alwaysIn and heights at start and end', () => {
+    const reservoir = solve(`
+      using CP;
+      dvar interval prod[1..3] size 2;
+      dvar interval cons[1..3] size 1;
+      cumulFunction level = step(0, 2) + sum(i in 1..3) stepAtEnd(prod[i], 3) - sum(i in 1..3) stepAtStart(cons[i], 3);
+      minimize max(i in 1..3) endOf(cons[i]);
+      subject to { level <= 6; noOverlap(prod); }`);
+    assert.equal(reservoir.info.objective, 7);
+    const heights = solve(`
+      using CP;
+      dvar interval a[1..3] size 4;
+      cumulFunction f = sum(i in 1..3) pulse(a[i], 1, 3);
+      maximize sum(i in 1..3) heightAtStart(a[i], f);
+      subject to { f <= 5; alwaysIn(f, 0, 10, 2, 5); forall(i in 1..3) endOf(a[i]) <= 12; }`);
+    assert.equal(heights.info.objective, 9);
+    const doc = solve(`
+      using CP;
+      dvar interval a size 3;
+      dvar interval b size 2;
+      cumulFunction f = step(0, 100) + pulse(a, 3) + pulse(a, 2) - stepAtEnd(a, 1) + stepAtStart(b, 2) - stepAtEnd(b, 3);
+      minimize endOf(b);
+      subject to { startOf(a) == 1; startOf(b) == 5; }
+      int hs[1..4] = [heightAtStart(a, f), heightAtEnd(a, f), heightAtStart(b, f), heightAtEnd(b, f)];
+      int v[t in 0..8] = cumulFunctionValue(f, t);
+      int n = numberOfSegments(f);
+      int sv[i in 0..n-1] = segmentValue(f, i);
+      execute { writeln(hs, v, sv); }`);
+    assert.equal(doc.lines.join(''), '[5 -1 2 -1][100 105 105 105 99 101 101 98 98][0 100 105 99 101 98]');
+  });
+
+  it('keeps state functions: one segment per window, alignment and transition distances', () => {
+    const { info, lines } = solve(`
+      using CP;
+      tuple triplet { int s1; int s2; int d; };
+      {triplet} M = {<0, 1, 2>, <1, 0, 2>};
+      dvar interval a size 3;
+      dvar interval b size 3;
+      dvar interval c size 2;
+      stateFunction f with M;
+      minimize max(endOf(a), endOf(b), endOf(c));
+      subject to { alwaysEqual(f, a, 0, true, true); alwaysEqual(f, b, 1); alwaysEqual(f, c, 0, true, true); alwaysNoState(f, 20, 30); }
+      int n = numberOfSegments(f);
+      int vals[i in 0..n-1] = segmentValue(f, i);
+      int at6 = stateFunctionValue(f, 6);
+      execute { writeln(vals, at6); }`);
+    // a and c cannot share a segment (both aligned, sizes differ): back to back, then b after the transition.
+    assert.equal(info.objective, 10);
+    assert.equal(lines.join(''), '[-1 0 0 -1 1 -1]-1');
+  });
+
+  it('evaluates functions of intervals, overlap lengths, isomorphism and equal sequences', () => {
+    const { info, lines } = solve(`
+      using CP;
+      pwlFunction cost = piecewise{ 0 -> 4; 2 -> 10; 0 } (4, 0);
+      stepFunction speed = stepwise{ 1 -> 3; 2 -> 6; 3 };
+      dvar interval a in 0..20 size 3;
+      dvar interval b optional in 0..20 size 2;
+      dvar interval c in 0..20 size 4;
+      dvar interval d[1..2] size 3;
+      dvar interval e[1..2] optional size 3;
+      dvar int m[1..2] in -1..2;
+      dvar sequence s1 in all(i in 1..2) d[i];
+      dvar sequence s2 in all(i in 1..2) e[i];
+      maximize startEval(a, cost) + 10 * presenceOf(b) - endEval(b, speed, 7) + overlapLength(a, c) + overlapLength(a, 2, 5);
+      subject to {
+        startOf(c) == 4; presenceOf(b) == 1; startOf(b) >= 1;
+        isomorphism(d, e, m, -1); noOverlap(s1); sameSequence(s1, s2); startOf(d[1]) >= 3;
+      }
+      execute { writeln(m, " ", e[1].start, " ", e[2].start); }`);
+    assert.equal(info.objective, 20);
+    assert.equal(lines.join(''), '[1 2] 3 6');
+  });
+
+  it('solves staticLexFull with priorities, weights and tolerances', () => {
+    const { info, lines } = solve(`
+      dvar int x in 0..10; dvar int y in 0..10; dvar int z in 0..10;
+      dexpr int cost = 3 * x + 2 * y + z;
+      dexpr int time = 20 - x - y;
+      dexpr int risk = z - y;
+      minimize staticLexFull([cost, time, risk], [1, 1, 1], [2, 1, 1], [0, 0, 0], [0.5, 0, 0]);
+      subject to { x + y + z >= 6; y <= 4; }
+      execute { writeln(cost, " ", time + risk); }`);
+    assert.equal(info.objective, 6);
+    assert.equal(lines.join(''), '9 17');
+  });
+
+  it('constrains lex / strictLex and minimizes a standard deviation', () => {
+    const { info } = solve(`
+      using CP;
+      dvar int x[1..4] in 0..10;
+      minimize standardDeviation(x);
+      subject to { sum(i in 1..4) x[i] == 10; strictLex(x, [3, 3, 3, 3]); strong(x); }`);
+    assert.ok(Math.abs(info.objective - 0.5) < 1e-6);
+    const consts = solve(`
+      float a = log(100); float b = lg(128); float c = ln(1); float d = distToInt(-2.5);
+      int i = intValue("-2"); int m = matchAt("Monday", "day"); float sdv = standardDeviation([2, 4, 4, 4, 5, 5, 7, 9]);
+      int lx = lex([1, 2, 3], [1, 2, 4]); int slx = strictLex([1, 2, 3], [1, 2, 3]);
+      execute { writeln(a, " ", b, " ", c, " ", d, " ", i, " ", m, " ", sdv, " ", lx, " ", slx); }`);
+    assert.equal(consts.lines.join(''), '2 7 0 0.5 -2 3 2 1 0');
   });
 });
 

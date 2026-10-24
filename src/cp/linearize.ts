@@ -562,6 +562,7 @@ function refersTo(d: CPDef, id: number): boolean {
       return has(d.idx) || d.items.some(has);
     case 'abs':
     case 'fn':
+    case 'func':
       return has(d.x);
     case 'calendar':
       return has(d.start) || has(d.end);

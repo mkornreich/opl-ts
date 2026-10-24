@@ -9,9 +9,12 @@ import {
   Calendar, Abs, AllDifferent, Circuit, Distribute, Div, Element, Linear as LinearProp, LinearNe, MinMax, Mod, Monotone,
   ReifLinear, ReifMember, Table, Times, type LinKind,
 } from './propagators.js';
+import { CumulProfile, FuncProp, StateCheck, type CumulBound, type CumulItem, type StateItem } from './cumul.js';
 import { Cumulative, Disjunctive, Reservoir, type Task } from './sched.js';
 import { Store } from './store.js';
-import { Activity, CP_FLOAT_BOUND, CP_MAXINT, Resource, type CmpOp, type CPCons, type CPDef } from './terms.js';
+import {
+  Activity, CP_FLOAT_BOUND, CP_MAXINT, Resource, StateFunction, type CmpOp, type CPCons, type CPDef, type CumulTerm, type FunctionWindow,
+} from './terms.js';
 
 interface LinForm {
   coefs: number[];
@@ -227,7 +230,51 @@ export class CPBuilder {
       case 'uses':
         this.use(c.how, c.act, c.res, c.amount, c.presence);
         return true;
+      case 'cumul':
+        this.cumul(c.terms, c.lo, c.hi, c.window);
+        return true;
+      case 'stateCheck':
+        this.stateCheck(c.f);
+        return true;
     }
+  }
+
+  private windowVars(w: FunctionWindow): { start: number | null; end: number | null; presence: number } {
+    if (w.k === 'all') return { start: null, end: null, presence: -1 };
+    if (w.k === 'fixed') return { start: this.constant(w.from), end: this.constant(w.to), presence: -1 };
+    return { start: w.act.start.id, end: w.act.end.id, presence: w.act.presence ? w.act.presence.id : -1 };
+  }
+
+  /** lo <= f <= hi on the window, and f >= 0 everywhere. */
+  private cumul(terms: CumulTerm[], lo: number, hi: number, window: FunctionWindow): void {
+    const items: CumulItem[] = terms.map((t) => {
+      const height = this.varOf(t.height);
+      if (!t.act) {
+        return { step: t.kind === 'step', start: this.constant(t.from), end: this.constant(t.to), dur: -1, height, presence: -1 };
+      }
+      const presence = t.act.presence ? t.act.presence.id : -1;
+      if (t.kind === 'pulse') {
+        const task = this.task(t.act, presence, 0);
+        return { step: false, start: task.start, end: task.end, dur: task.dur, height, presence };
+      }
+      return { step: true, start: (t.at === 'start' ? t.act.start : t.act.end).id, end: -1, dur: -1, height, presence };
+    });
+    const bounds: CumulBound[] = [{ start: null, end: null, presence: -1, lo: 0, hi: Infinity }];
+    bounds.push({ ...this.windowVars(window), lo, hi });
+    this.addProp(new CumulProfile('cumul function', items, bounds));
+  }
+
+  private stateCheck(f: StateFunction): void {
+    const items: StateItem[] = f.windows.map((w) => ({
+      kind: w.kind,
+      ...this.windowVars(w.window),
+      value: w.kind === 'equal' ? this.constant(w.value) : w.state ? w.state.id : -1,
+      lo: w.lo,
+      hi: w.hi,
+      aligns: w.aligns,
+      aligne: w.aligne,
+    }));
+    this.addProp(new StateCheck(f.name, items, (a, b) => f.distance(a, b)));
   }
 
   /** sum(coefs * bools) + c  kind  0 */
@@ -337,6 +384,9 @@ export class CPBuilder {
       case 'calendar':
         this.addProp(new Calendar(v(def.start), v(def.end), def.size, def.f));
         return;
+      case 'func':
+        this.addProp(new FuncProp(v(def.z), v(def.x), def.f, def.points));
+        return;
     }
   }
 
@@ -412,6 +462,10 @@ function describe(c: CPCons): string {
       return c.positive ? 'allowedAssignments' : 'forbiddenAssignments';
     case 'uses':
       return `${c.how}`;
+    case 'cumul':
+      return 'a cumul function constraint';
+    case 'stateCheck':
+      return 'a state function constraint';
   }
   return c.k;
 }

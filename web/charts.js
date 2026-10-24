@@ -128,13 +128,25 @@ function inkOn(cssVar) {
 }
 
 function resourceLabel(r) {
-  const m = /^noOverlap#(\d+)$/.exec(r);
-  return m ? `noOverlap ${m[1]}` : r;
+  const m = /^(noOverlap|cumul)#(\d+)$/.exec(r);
+  return m ? `${m[1] === 'cumul' ? 'cumul function' : 'noOverlap'} ${m[2]}` : r;
+}
+
+/** Bars of one row in lanes, so that overlapping bars (a discrete resource) do not hide each other. */
+function lanes(acts) {
+  const out = [];
+  for (const a of [...acts].sort((p, q) => p.start - q.start || p.end - q.end)) {
+    const lane = out.find((l) => l[l.length - 1].end <= a.start);
+    if (lane) lane.push(a);
+    else out.push([a]);
+  }
+  return out;
 }
 
 /**
  * Gantt chart: one row per resource (or per activity when activities use no
- * resource), bars colored by job when there are 2..8 jobs.
+ * resource), split into lanes where its activities overlap, bars colored by
+ * job when there are 2..8 jobs.
  */
 export function gantt(container, activities, { width = 560 } = {}) {
   container.replaceChildren();
@@ -148,6 +160,7 @@ export function gantt(container, activities, { width = 560 } = {}) {
   }
   const collator = new Intl.Collator('en', { numeric: true });
   const rowNames = [...byRow.keys()].sort(collator.compare);
+  const rows = rowNames.flatMap((r) => lanes(byRow.get(r)).map((acts, k) => ({ r, acts, first: k === 0 })));
   const groups = [...new Set(activities.map((a) => groupOf(a.name)))].sort(collator.compare);
   const colored = groups.length >= 2 && groups.length <= 8;
   const slotOf = (a) => (colored ? SLOTS[groups.indexOf(groupOf(a.name))] : '--s1');
@@ -168,7 +181,7 @@ export function gantt(container, activities, { width = 560 } = {}) {
   const rowH = 26;
   const barH = 18;
   const top = 22;
-  const height = top + rowNames.length * rowH + 6;
+  const height = top + rows.length * rowH + 6;
   const end = Math.max(1, ...activities.map((a) => a.end));
   const start = Math.min(0, ...activities.map((a) => a.start));
   const ts = ticks(start, end, 6);
@@ -181,10 +194,10 @@ export function gantt(container, activities, { width = 560 } = {}) {
     el('line', { x1: x(t), x2: x(t), y1: top - 6, y2: height - 4, class: t === start ? 'axis' : 'grid' }, svg);
     text(svg, x(t), 12, formatNumber(t), { 'text-anchor': 'middle' });
   }
-  rowNames.forEach((r, i) => {
+  rows.forEach(({ r, acts, first }, i) => {
     const y = top + i * rowH + (rowH - barH) / 2;
-    text(svg, labelW - 10, y + barH / 2 + 4, resourceLabel(r), { 'text-anchor': 'end' });
-    for (const a of byRow.get(r)) {
+    if (first) text(svg, labelW - 10, y + barH / 2 + 4, resourceLabel(r), { 'text-anchor': 'end' });
+    for (const a of acts) {
       // A 2px surface gap between abutting bars.
       const x0 = x(a.start) + 1;
       const w = Math.max(2, x(a.end) - x(a.start) - 2);

@@ -105,6 +105,58 @@ export class Sequence {
   ) {}
 }
 
+/** One elementary term of a cumul function (CP Optimizer). */
+export interface CumulTerm {
+  /** pulse: height on [from, to); step: height on [from, +infinity). */
+  kind: 'pulse' | 'step';
+  /** The interval of pulse(a, h), stepAtStart(a, h) and stepAtEnd(a, h); null for pulse(u, v, h) and step(u, h). */
+  act: Activity | null;
+  /** Steps of an interval: at its start or its end. */
+  at: 'start' | 'end';
+  /** The points of pulse(u, v, h) and step(u, h). */
+  from: number;
+  to: number;
+  height: Linear;
+}
+
+/** Where a cumul or state function constraint applies: everywhere, on [from, to), or on a present interval. */
+export type FunctionWindow = { k: 'all' } | { k: 'fixed'; from: number; to: number } | { k: 'interval'; act: Activity };
+
+/** What a state function constraint asks for on its window. */
+export interface StateWindow {
+  kind: 'equal' | 'constant' | 'none' | 'in';
+  window: FunctionWindow;
+  /** alwaysEqual: the state. */
+  value: number;
+  /** alwaysIn: the allowed states. */
+  lo: number;
+  hi: number;
+  aligns: boolean;
+  aligne: boolean;
+  /** alwaysConstant: the (unknown) state, made when the model is finished. */
+  state?: DVar;
+}
+
+/**
+ * A state function (CP Optimizer): at any time undefined or one non-negative
+ * state; with a transition matrix, consecutive states v1, v2 are at least
+ * M[v1][v2] apart.
+ */
+export class StateFunction {
+  readonly windows: StateWindow[] = [];
+  constructor(
+    readonly name: string,
+    /** Minimal distance from state a to a later state b; null without a transition matrix. */
+    readonly transitions: ((a: number, b: number) => number) | null,
+    /** The states of the transition matrix. */
+    readonly states: number[] = [],
+  ) {}
+
+  distance(a: number, b: number): number {
+    return this.transitions ? this.transitions(a, b) : 0;
+  }
+}
+
 export type ResourceKind = 'unary' | 'discrete' | 'reservoir' | 'state' | 'alternative';
 
 export class Resource {
@@ -137,7 +189,11 @@ export type CPCons =
   /** sub: subCircuit (nodes may point to themselves to stay out of the circuit) */
   | { k: 'circuit'; xs: Linear[]; offset: number; sub?: boolean }
   | { k: 'table'; xs: Linear[]; tuples: number[][]; positive: boolean }
-  | { k: 'uses'; how: 'requires' | 'consumes' | 'produces'; act: Activity; res: Resource; amount: Linear; presence: DVar | null };
+  | { k: 'uses'; how: 'requires' | 'consumes' | 'produces'; act: Activity; res: Resource; amount: Linear; presence: DVar | null }
+  /** lo <= f(t) <= hi on the window, for the cumul function f = sum of terms (f >= 0 everywhere). */
+  | { k: 'cumul'; terms: CumulTerm[]; lo: number; hi: number; window: FunctionWindow }
+  /** The exact semantics of a state function, checked once its windows are fixed. */
+  | { k: 'stateCheck'; f: StateFunction };
 
 export class CPConstraint {
   constructor(readonly c: CPCons) {}
@@ -154,7 +210,9 @@ export type CPDef =
   | { k: 'linear'; z: DVar; e: LinExpr }
   | { k: 'post'; cons: CPCons }
   /** end = the earliest time when `size` units of work (f, in percent) have been done since start. */
-  | { k: 'calendar'; start: DVar; end: DVar; size: number; f: StepFunction };
+  | { k: 'calendar'; start: DVar; end: DVar; size: number; f: StepFunction }
+  /** z = f(x) for a fixed function of one integer variable; points: where f may change slope or value. */
+  | { k: 'func'; z: DVar; x: DVar; f: (x: number) => number; points: number[] };
 
 /** What the evaluator needs from the model (generation) or the live search. */
 export interface CPHooks {
@@ -297,6 +355,24 @@ export class Flattener {
     const hi = isMin ? Math.min(...bs.map((b) => b[1])) : Math.max(...bs.map((b) => b[1]));
     const z = this.h.newVar(lo, hi, xs.every((x) => x.isInt), isMin ? 'min' : 'max');
     this.h.define({ k: 'minmax', isMin, z, xs });
+    return z;
+  }
+
+  /** z = f(e) for a fixed function of an integer expression (linear between the points). */
+  func(f: (x: number) => number, points: number[], e: Linear, isInt: boolean, name: string): DVar {
+    const x = this.varAtom(e, name);
+    const [lo, hi] = this.h.bounds(x);
+    let mn = Math.min(f(lo), f(hi));
+    let mx = Math.max(f(lo), f(hi));
+    for (const p of points) {
+      for (const t of [Math.floor(p) - 1, Math.floor(p), Math.ceil(p)]) {
+        if (t <= lo || t >= hi) continue;
+        mn = Math.min(mn, f(t));
+        mx = Math.max(mx, f(t));
+      }
+    }
+    const z = this.h.newVar(isInt ? Math.floor(mn) : mn, isInt ? Math.ceil(mx) : mx, isInt, name);
+    this.h.define({ k: 'func', z, x, f, points });
     return z;
   }
 

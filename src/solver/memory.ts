@@ -26,6 +26,11 @@ export function reserve(bytes: number, what: string): void {
   }
 }
 
+/** True when allocating `bytes` more stays within the budget (for optional work such as a presolve). */
+export function fits(bytes: number): boolean {
+  return memoryInUse() + bytes <= memoryLimitBytes();
+}
+
 let warned = false;
 
 /** True when the process is over its budget (long searches then stop with a limit status). */

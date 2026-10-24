@@ -204,12 +204,14 @@ class Search {
     const selections: number[] = [];
     for (const byAlt of this.p.selections.values()) for (const sel of byAlt.values()) selections.push(...sel.map((v) => v.id));
     const rest = () => this.label([...Array(this.s.numVars).keys()], true, k);
+    // Sequence orders (ranks) are decided before start times.
+    const ranks = this.p.ev.rankVarsOf(this.p.vars).map((v) => v.id);
     // Scheduling models: choose resources, order the tasks of each unary
     // resource, set start times earliest first, then the rest.
     if (this.p.activities.length) {
       const unary = [...this.b.disjunctives.values()];
       return this.label(selections, false, () =>
-        this.rank(unary, () => this.setTimes(this.p.activities, () => this.label(decision, true, rest))));
+        this.label(ranks, true, () => this.rank(unary, () => this.setTimes(this.p.activities, () => this.label(decision, true, rest)))));
     }
     return this.label(decision, true, () => this.label(selections, false, rest));
   }

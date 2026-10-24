@@ -15,9 +15,10 @@
 
 import { DenseSimplex, type SimplexStatus, type Snapshot } from './dense.js';
 import { type LinearProgram, type MIPResult } from './lp.js';
-import { memoryExceeded } from './memory.js';
+import { fits, memoryExceeded } from './memory.js';
 import { createSimplex, solveLP } from './simplex.js';
 import { SparseSimplex } from './sparse.js';
+import { postsolve, presolve } from './presolve.js';
 
 const INT_TOL = 1e-6;
 
@@ -89,6 +90,32 @@ function withRootCuts(lp: LinearProgram, lower: Float64Array, upper: Float64Arra
  */
 export function solveMIP(input: LinearProgram, options: MIPOptions = {}): MIPResult {
   if (options.cuts !== undefined || !input.integer.some((v) => v)) return branchAndBound(input, options);
+  // The presolve copies the rows twice: skip it when that does not fit the memory budget.
+  const nonZeros = input.rows.reduce((n, r) => n + r.index.length, 0);
+  if (process.env.OPL_NO_PRESOLVE || !fits(64 * nonZeros + 512 * input.rows.length)) return searchWithRestart(input, options);
+  // Presolve, search the reduced problem, then duals from the original.
+  const t0 = performance.now();
+  const pre = presolve(input);
+  const deadline = options.timeLimit ? t0 + options.timeLimit * 1000 : Infinity;
+  if (pre.infeasible) return finish(input, 'infeasible', Infinity, -Infinity, null, 0, 0, deadline);
+  if (pre.lp.numVars === 0) {
+    const x = postsolve(pre, input.numVars, new Float64Array(0));
+    const feasible = input.rows.every((r) => {
+      let a = 0;
+      for (let k = 0; k < r.index.length; k++) a += r.value[k] * x[r.index[k]];
+      return a >= r.lower - 1e-7 * Math.max(1, Math.abs(r.lower)) && a <= r.upper + 1e-7 * Math.max(1, Math.abs(r.upper));
+    });
+    if (!feasible) return finish(input, 'infeasible', Infinity, -Infinity, null, 0, 0, deadline);
+    return finish(input, 'optimal', pre.lp.objConstant, pre.lp.objConstant, x, 0, 0, deadline);
+  }
+  const left = options.timeLimit ? options.timeLimit - (performance.now() - t0) / 1000 : undefined;
+  const r = searchWithRestart(pre.lp, { ...options, timeLimit: left });
+  if (r.status !== 'optimal' && r.status !== 'feasible') return { ...r, x: new Float64Array(input.numVars), duals: new Float64Array(input.rows.length), reducedCosts: new Float64Array(input.numVars) };
+  const x = postsolve(pre, input.numVars, r.x);
+  return finish(input, r.status, r.objective, r.bound, x, r.iterations, r.nodes, deadline);
+}
+
+function searchWithRestart(input: LinearProgram, options: MIPOptions): MIPResult {
   const t0 = performance.now();
   const maxNodes = options.maxNodes ?? 10_000_000;
   const first = branchAndBound(input, { ...options, cuts: false, maxNodes: Math.min(maxNodes, RESTART_NODES) });

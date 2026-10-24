@@ -35,6 +35,98 @@ function taskVars(tasks: Task[]): number[] {
   return [...vs];
 }
 
+/** A task seen forwards, or mirrored in time (est = -lct, lct = -est) for the latest-end rules. */
+function view(s: Store, t: Task, mirror: boolean): { est: number; lct: number; p: number } {
+  return mirror ? { est: -s.max(t.end), lct: -s.min(t.start), p: s.min(t.dur) } : { est: s.min(t.start), lct: s.max(t.end), p: s.min(t.dur) };
+}
+
+/** est >= e (forwards), or end <= -e (mirrored). */
+function pushAfter(s: Store, t: Task, e: number, mirror: boolean): boolean {
+  return mirror ? s.setMax(t.end, -e) : s.setMin(t.start, e);
+}
+
+/**
+ * Edge finding on a unary resource: when task i cannot end before the
+ * latest end U of a set Omega (the tasks with lct <= U), it ends after all of
+ * Omega, so it starts after Omega's earliest completion time.
+ */
+const NO_EDGE_FINDING = typeof process !== 'undefined' && !!process.env?.OPL_NO_EDGE_FINDING;
+
+function edgeFindUnary(s: Store, ts: Task[], live: number[], mirror: boolean): boolean {
+  if (live.length < 2 || NO_EDGE_FINDING) return true;
+  const items = live.map((i) => ({ i, ...view(s, ts[i], mirror) }));
+  const byEst = [...items].sort((a, b) => a.est - b.est);
+  const lcts = [...new Set(items.map((x) => x.lct))].sort((a, b) => a - b);
+  const push = new Map<number, number>();
+  for (const U of lcts) {
+    const omega = byEst.filter((x) => x.lct <= U);
+    const m = omega.length;
+    if (m === 0 || m === items.length) continue;
+    // v_k = est_k + p of the Omega tasks starting no earlier; ECT(Omega) = max v.
+    const suffix = new Float64Array(m + 1);
+    for (let k = m - 1; k >= 0; k--) suffix[k] = suffix[k + 1] + omega[k].p;
+    const v = omega.map((x, k) => x.est + suffix[k]);
+    const pre = new Float64Array(m);
+    const post = new Float64Array(m + 1).fill(-Infinity);
+    for (let k = 0; k < m; k++) pre[k] = Math.max(k ? pre[k - 1] : -Infinity, v[k]);
+    for (let k = m - 1; k >= 0; k--) post[k] = Math.max(post[k + 1], v[k]);
+    const ect = pre[m - 1];
+    if (ect > U) return false;
+    for (const x of items) {
+      if (x.lct <= U || x.p <= 0) continue;
+      // Omega with x inserted at its est position.
+      let lo = 0;
+      let hi = m;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (omega[mid].est <= x.est) lo = mid + 1;
+        else hi = mid;
+      }
+      const withX = Math.max(lo ? pre[lo - 1] + x.p : -Infinity, post[lo], x.est + x.p + suffix[lo]);
+      if (withX > U && ect > (push.get(x.i) ?? -Infinity)) push.set(x.i, ect);
+    }
+  }
+  for (const [i, e] of push) if (!pushAfter(s, ts[i], e, mirror)) return false;
+  return true;
+}
+
+/**
+ * Energy-based edge finding on a cumulative resource: for a window [L, U]
+ * and the tasks Omega inside it, the energy must fit (overload check); a task
+ * i outside whose energy no longer fits with Omega's ends after Omega and
+ * starts at least L + ceil(rest / c_i), rest = e(Omega) - (C - c_i)(U - L).
+ */
+function edgeFindCumulative(s: Store, live: Task[], cap: number, mirror: boolean): boolean {
+  if (live.length < 2 || live.length > 60 || NO_EDGE_FINDING) return true;
+  const items = live.map((t) => {
+    const v = view(s, t, mirror);
+    const c = s.min(t.amount);
+    return { t, ...v, c, e: c * v.p };
+  });
+  const ests = [...new Set(items.map((x) => x.est))].sort((a, b) => a - b);
+  const lcts = [...new Set(items.map((x) => x.lct))].sort((a, b) => a - b);
+  const push = new Map<Task, number>();
+  for (const U of lcts) {
+    for (const L of ests) {
+      if (L >= U) break;
+      let E = 0;
+      for (const x of items) if (x.est >= L && x.lct <= U) E += x.e;
+      if (E === 0) continue;
+      if (E > cap * (U - L)) return false;
+      for (const x of items) {
+        if ((x.est >= L && x.lct <= U) || x.lct <= U || x.e <= 0 || x.c > cap) continue;
+        if (E + x.e <= cap * (U - Math.min(L, x.est))) continue;
+        const rest = E - (cap - x.c) * (U - L);
+        if (rest <= 0) continue;
+        const e = L + Math.ceil(rest / x.c);
+        if (e > (push.get(x.t) ?? -Infinity)) push.set(x.t, e);
+      }
+    }
+  }
+  for (const [t, e] of push) if (!pushAfter(s, t, e, mirror)) return false;
+  return true;
+}
+
 /**
  * Activities that may not overlap: all pairs on a unary resource, pairs
  * requiring different states on a state resource.
@@ -80,7 +172,8 @@ export class Disjunctive implements Propagator {
         if (!bFirst && (!s.setMin(b.start, s.min(a.end)) || !s.setMax(a.end, s.max(b.start)))) return false;
       }
     }
-    return this.byState || this.overload(s, live);
+    if (this.byState) return true;
+    return this.overload(s, live) && edgeFindUnary(s, ts, live, false) && edgeFindUnary(s, ts, live, true);
   }
 
   /** The tasks inside any window [est, lct] must fit into it. */
@@ -156,6 +249,7 @@ export class Cumulative implements Propagator {
       if (next !== undefined && next > events[k][0] && h > 0) segs.push({ from: events[k][0], to: next, h });
     }
     for (const seg of segs) if (seg.h > cap) return false;
+    if (!edgeFindCumulative(s, live, cap, false) || !edgeFindCumulative(s, live, cap, true)) return false;
     for (const t of live) {
       const q = s.min(t.amount);
       if (q <= 0) continue;

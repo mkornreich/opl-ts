@@ -15,7 +15,9 @@ import { IlogRuntime } from './ilog.js';
 import { clampBounds } from './cp/builder.js';
 import { linearize, type QuadTerm } from './cp/linearize.js';
 import { solveCP } from './cp/search.js';
-import { Activity, CP_MAXINT, CPConstraint, Flattener, Resource, Sequence, StepFunction, type CPCons, type CPDef, type CPHooks } from './cp/terms.js';
+import {
+  Activity, CP_MAXINT, CPConstraint, Flattener, Resource, Sequence, StateFunction, StepFunction, type CPCons, type CPDef, type CPHooks, type StateWindow,
+} from './cp/terms.js';
 import { DBConnection } from './db.js';
 import { fail, type SourcePos } from './errors.js';
 import { DExpr, dvarValue, Evaluator, MAXINT, Predicate, Scope } from './eval.js';
@@ -114,6 +116,7 @@ export class ModelInstance implements HostObject {
   private cpDefs: CPDef[] = [];
   private cpRefs: ConstraintRef[] = [];
   private activities: Activity[] = [];
+  private stateFunctions: StateFunction[] = [];
   private selections = new Map<Activity, Map<Resource, DVar[]>>();
   private usesCP = false;
   private horizon: number | null = null;
@@ -243,7 +246,7 @@ export class ModelInstance implements HostObject {
 
   /** True for variables, dexprs and other model elements that exist only after generation. */
   isGeneratedElement(name: string): boolean {
-    return this.pre.some((st) => (st.k === 'var' || st.k === 'dexpr' || st.k === 'activity' || st.k === 'resource' || st.k === 'sequence' || st.k === 'constraintDecl') && st.name === name);
+    return this.pre.some((st) => (st.k === 'var' || st.k === 'dexpr' || st.k === 'activity' || st.k === 'resource' || st.k === 'sequence' || st.k === 'stateFunction' || st.k === 'constraintDecl') && st.name === name);
   }
 
   get hasMain(): boolean {
@@ -502,6 +505,7 @@ export class ModelInstance implements HostObject {
       case 'activity':
       case 'resource':
       case 'sequence':
+      case 'stateFunction':
         if (ev.phase === 'post') fail('decision variables, activities and resources must be declared before the objective', st.pos);
         return;
       case 'objective':
@@ -611,6 +615,7 @@ export class ModelInstance implements HostObject {
     this.quadGlobal = false;
     this.cpRefs = [];
     this.activities = [];
+    this.stateFunctions = [];
     this.selections = new Map();
     this.labels = new Map();
     ev.selections = this.selections;
@@ -630,6 +635,7 @@ export class ModelInstance implements HostObject {
         } else if (st.k === 'activity') this.declareActivity(st);
         else if (st.k === 'resource') this.declareResource(st);
         else if (st.k === 'sequence') this.declareSequence(st);
+        else if (st.k === 'stateFunction') this.declareStateFunction(st);
       }
       if (this.objective) this.walk(this.objective.constraints, this.global);
       this.finishScheduling();
@@ -876,12 +882,96 @@ export class ModelInstance implements HostObject {
     this.global.define(st.name, { value, type: { k: 'host' } });
   }
 
+  /** stateFunction f[dims] [with M]; */
+  private declareStateFunction(st: Extract<Stmt, { k: 'stateFunction' }>): void {
+    const ev = this.ev;
+    this.usesCP = true;
+    const table = st.matrix ? ev.transitionTable(ev.eval(st.matrix, this.global), st.matrix.pos) : null;
+    const sets = ev.indexSets(st.dims, this.global);
+    const make = (_: Scope, p: Value[]): StateFunction => {
+      const f = new StateFunction(st.name + keyPath(p), table?.dist ?? null, table?.states ?? []);
+      this.stateFunctions.push(f);
+      return f;
+    };
+    const value = st.dims.length ? ev.buildArray(st.dims, sets, this.global, make) : make(this.global, []);
+    this.global.define(st.name, { value, type: { k: 'host' } });
+  }
+
+  /**
+   * State functions: windows asking for different states (or for a state and
+   * for none) do not overlap, with the transition distance between them when
+   * the distances obey the triangle inequality; the exact semantics are
+   * checked once the windows are fixed.
+   */
+  private finishStateFunctions(): void {
+    const h = this.hooks();
+    const present = (p: DVar | null): CPCons => (p ? { k: 'cmp', op: '=', l: p, r: 1 } : { k: 'const', value: true });
+    for (const f of this.stateFunctions) {
+      const ws = f.windows;
+      if (!ws.length) continue;
+      // With a transition matrix the states are those of the matrix; without, any state (one fresh state per window is enough).
+      const values = [...f.states, ...ws.map((w) => (w.kind === 'equal' ? w.value : w.kind === 'in' && !f.transitions ? w.hi : 0))];
+      const top = Math.max(0, ...values) + (f.transitions ? 0 : ws.filter((w) => w.kind === 'constant').length);
+      for (const w of ws) if (w.kind === 'constant') w.state = h.newVar(0, top, true, `${f.name}.state`);
+      const states = [...new Set([...f.states, ...ws.filter((w) => w.kind === 'equal').map((w) => w.value)])];
+      let triangle = states.length <= 60;
+      for (const a of triangle ? states : []) {
+        for (const b of states) for (const c of states) if (f.distance(a, c) > f.distance(a, b) + f.distance(b, c)) triangle = false;
+      }
+      const span = (w: StateWindow): [LinExpr, LinExpr, DVar | null] => {
+        const win = w.window;
+        if (win.k === 'interval') return [LinExpr.of(win.act.start), LinExpr.of(win.act.end), win.act.presence];
+        if (win.k === 'fixed') return [new LinExpr(new Map(), win.from), new LinExpr(new Map(), win.to), null];
+        return [new LinExpr(new Map(), -CP_MAXINT), new LinExpr(new Map(), CP_MAXINT), null];
+      };
+      const defines = (w: StateWindow) => w.kind === 'equal' || w.kind === 'constant';
+      for (let i = 0; i < ws.length; i++) {
+        for (let j = i + 1; j < ws.length; j++) {
+          let [a, b] = [ws[i], ws[j]];
+          if (!defines(a)) [a, b] = [b, a];
+          if (!defines(a)) continue;
+          const [sa, ea, pa] = span(a);
+          const [sb, eb, pb] = span(b);
+          const apart = (da: number, db: number): CPCons => ({
+            k: 'or',
+            a: { k: 'cmp', op: '<=', l: ea.clone().addScaled(da, 1), r: sb },
+            b: { k: 'cmp', op: '<=', l: eb.clone().addScaled(db, 1), r: sa },
+          });
+          const va = a.state ?? a.value;
+          let body: CPCons | null = null;
+          if (b.kind === 'none') body = apart(0, 0);
+          else if (b.kind === 'in') {
+            if (!a.state) body = a.value < b.lo || a.value > b.hi ? apart(0, 0) : null;
+            else body = { k: 'or', a: apart(0, 0), b: { k: 'and', a: { k: 'cmp', op: '>=', l: va, r: b.lo }, b: { k: 'cmp', op: '<=', l: va, r: b.hi } } };
+          } else if (!a.state && !b.state) {
+            if (a.value !== b.value) body = triangle ? apart(f.distance(a.value, b.value), f.distance(b.value, a.value)) : apart(0, 0);
+            else if (a.aligns || a.aligne || b.aligns || b.aligne) {
+              // Overlapping windows share a segment: aligned ones start / end first / last.
+              let inside: CPCons = { k: 'const', value: true };
+              const add = (c: CPCons) => (inside = { k: 'and', a: inside, b: c });
+              if (a.aligns) add({ k: 'cmp', op: '<=', l: sa, r: sb });
+              if (b.aligns) add({ k: 'cmp', op: '<=', l: sb, r: sa });
+              if (a.aligne) add({ k: 'cmp', op: '>=', l: ea, r: eb });
+              if (b.aligne) add({ k: 'cmp', op: '>=', l: eb, r: ea });
+              body = { k: 'or', a: apart(0, 0), b: inside };
+            }
+          } else body = { k: 'or', a: apart(0, 0), b: { k: 'cmp', op: '=', l: va, r: b.state ?? b.value } };
+          if (!body) continue;
+          const both: CPCons = { k: 'and', a: present(pa), b: present(pb) };
+          this.cpCons.push(pa || pb ? { k: 'imp', a: both, b: body } : body);
+        }
+      }
+      this.cpCons.push({ k: 'stateCheck', f });
+    }
+  }
+
   /**
    * After the constraints: transition times on OPL 3 unary resources, and
    * the breaks of resources (breakable activities run around them, others
    * must not overlap them).
    */
   private finishScheduling(): void {
+    this.finishStateFunctions();
     if (!this.activities.length) return;
     const uses = new Map<Resource, { act: Activity; presence: DVar | null }[]>();
     const walk = (c: unknown): void => {
@@ -1151,7 +1241,10 @@ export class ModelInstance implements HostObject {
   /** Generates and solves the model; solution values are stored on variables and constraints. */
   solve(): SolveInfo {
     const e = this.objective?.e;
-    if (e?.k === 'call' && e.fn === 'staticLex') return this.solveLexicographic(e.args);
+    if (e?.k === 'call' && e.fn === 'staticLex') {
+      return this.solveLexicographic(e.args.map((c) => ({ obj: () => this.linearOf(c), tol: (z: number) => 1e-9 * Math.max(1, Math.abs(z)) })));
+    }
+    if (e?.k === 'call' && e.fn === 'staticLexFull') return this.solveLexicographic(this.lexLevels(e.args, e.pos));
     if (this.kept) {
       // Generated by a script (and possibly changed since): solve it as it is.
       const obj = this.kept.obj;
@@ -1247,28 +1340,72 @@ export class ModelInstance implements HostObject {
   }
 
   /**
-   * staticLex(c1, c2, ...): optimise c1, then c2 with c1 held at its optimum, and so on.
-   * The reported objective is the value of the first criterion.
+   * staticLexFull(goals, weights, priorities, abstol, reltol): the goals of
+   * one priority blended with their weights, the highest priority first; a
+   * later level may degrade an earlier one by max(abstol, reltol * |value|).
    */
-  private solveLexicographic(criteria: Expr[]): SolveInfo {
+  private lexLevels(args: Expr[], pos: SourcePos): { obj: () => LinExpr; tol: (z: number) => number }[] {
+    if (args.length < 3) fail('staticLexFull(goals, weights, priorities[, abstol, reltol]) needs goals, weights and priorities', pos);
+    const ev = this.ev;
+    const leaves = (v: Value): Value[] => (v instanceof OplArray || v instanceof RawArray ? v.items.flatMap(leaves) : [v]);
+    const goals = (): LinExpr[] => {
+      ev.phase = 'model';
+      ev.cp = this.hooks();
+      try {
+        return leaves(ev.eval(args[0], this.global)).map((g) => LinExpr.of(ev.linear(g, args[0].pos)));
+      } finally {
+        ev.cp = null;
+      }
+    };
+    // The goals name dexprs and variables of the model.
+    this.generate();
+    const n = goals().length;
+    const nums = (e: Expr | undefined, dflt: number): number[] => {
+      if (!e) return Array(n).fill(dflt);
+      const vs = leaves(ev.eval(e, this.global));
+      if (vs.length !== n || vs.some((v) => typeof v !== 'number')) fail(`staticLexFull: expected ${n} numbers, one per goal`, e.pos);
+      return vs as number[];
+    };
+    const [weights, priorities, abstol, reltol] = [nums(args[1], 1), nums(args[2], 0), nums(args[3], 0), nums(args[4], 0)];
+    return [...new Set(priorities)]
+      .sort((a, b) => b - a)
+      .map((p) => {
+        const members = priorities.flatMap((q, i) => (q === p ? [i] : []));
+        return {
+          obj: () => {
+            const gs = goals();
+            const sum = new LinExpr();
+            for (const i of members) sum.addScaled(gs[i], weights[i]);
+            return sum;
+          },
+          tol: (z: number) => Math.max(1e-9 * Math.max(1, Math.abs(z)), ...members.map((i) => Math.max(abstol[i], reltol[i] * Math.abs(z)))),
+        };
+      });
+  }
+
+  /**
+   * Lexicographic objectives: optimise each level with the earlier ones held
+   * at their optimum (within the level's tolerance).  The reported objective
+   * is the value of the first level.
+   */
+  private solveLexicographic(levels: { obj: () => LinExpr; tol: (z: number) => number }[]): SolveInfo {
     const max = this.objective?.sense === 'maximize';
-    const fixed: { e: Expr; value: number }[] = [];
+    const fixed: { obj: () => LinExpr; value: number; tol: number }[] = [];
     let info: SolveInfo | null = null;
-    for (const c of criteria) {
+    for (const level of levels) {
       this.generate();
       for (const f of fixed) {
-        const lin = this.linearOf(f.e).clone();
+        const lin = f.obj().clone();
         const k = lin.constant;
         lin.constant = 0;
-        const tol = 1e-9 * Math.max(1, Math.abs(f.value));
-        this.rows.push({ expr: lin, lower: max ? f.value - tol - k : -Infinity, upper: max ? Infinity : f.value + tol - k, ref: null });
+        this.rows.push({ expr: lin, lower: max ? f.value - f.tol - k : -Infinity, upper: max ? Infinity : f.value + f.tol - k, ref: null });
       }
-      const obj = this.linearOf(c);
+      const obj = level.obj();
       this.lastObjective = obj;
       this.tryLinearize(obj);
       info = this.usesCP ? this.solveWithCP(obj) : this.solveLinear(obj);
       if (!this.solved) return info;
-      fixed.push({ e: c, value: info.objective });
+      fixed.push({ obj: level.obj, value: info.objective, tol: level.tol(info.objective) });
     }
     if (info && fixed.length) info.objective = fixed[0].value;
     return info!;

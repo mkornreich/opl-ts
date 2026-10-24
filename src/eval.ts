@@ -5,7 +5,11 @@
 
 import type { Binder, Dim, Expr, Quantifier, TypeExpr } from './ast.js';
 import { fail, type SourcePos } from './errors.js';
-import { Activity, CP_MAXINT, CPConstraint, Flattener, isIntegral, linBounds, Resource, Sequence, StepFunction, type CmpOp, type CPCons, type CPHooks } from './cp/terms.js';
+import { cumulSegments, cumulValue, stateSegments, type StateFixed } from './cp/cumul.js';
+import {
+  Activity, CP_MAXINT, CPConstraint, Flattener, isIntegral, linBounds, Resource, Sequence, StateFunction, StepFunction,
+  type CmpOp, type CPCons, type CPHooks, type CumulTerm, type FunctionWindow, type StateWindow,
+} from './cp/terms.js';
 import { ConstraintRef, DVar, isLinear, LinExpr, linAdd, linMul, type Linear } from './linear.js';
 import { checkMemory } from './solver/memory.js';
 import {
@@ -33,10 +37,13 @@ export function dvarValue(v: DVar): number | string {
   return v.value;
 }
 
-/** A cumul function (CP Optimizer): a sum of pulse(interval, height) terms. */
+/** A cumul function (CP Optimizer): a sum of pulses and steps. */
 export class CumulExpr {
-  constructor(readonly pulses: { act: Activity; height: Linear }[]) {}
+  constructor(readonly terms: CumulTerm[]) {}
 }
+
+/** The time line of CP Optimizer: [-IntervalMax, IntervalMax]. */
+const INTERVAL_MAX = 1073741823;
 
 /** A piecewise-linear function: slopes[k] applies before bps[k] (the last slope after the last breakpoint). */
 export class PwlFunction {
@@ -187,6 +194,17 @@ export class Evaluator {
   }
 
   /** Like eval, but keeps decision variables and constraints as references. */
+  /** Cumul functions built from a dexpr: one value, so its height variables are shared. */
+  private readonly cumulOf = new WeakMap<DExpr, CumulExpr>();
+
+  private deref(d: DExpr): Value {
+    const known = this.cumulOf.get(d);
+    if (known) return known;
+    const v = this.evalRef(d.e, d.scope);
+    if (v instanceof CumulExpr) this.cumulOf.set(d, v);
+    return v;
+  }
+
   evalRef(e: Expr, s: Scope): Value {
     switch (e.k) {
       case 'num':
@@ -196,16 +214,18 @@ export class Evaluator {
         return e.name;
       case 'id': {
         const b = s.lookup(e.name);
-        if (b) return b.value instanceof DExpr ? this.evalRef(b.value.e, b.value.scope) : b.value;
+        if (b) return b.value instanceof DExpr ? this.deref(b.value) : b.value;
         if (e.name === 'maxint') return MAXINT;
         if (e.name === 'infinity') return Infinity;
+        if (e.name === 'true') return 1;
+        if (e.name === 'false') return 0;
         fail(`unknown identifier '${e.name}'`, e.pos);
       }
       // falls through (unreachable)
       case 'index': {
         let target = this.evalRef(e.target, s);
         for (const a of e.args) target = this.indexInto(target, this.eval(a, s), a.pos);
-        return target instanceof DExpr ? this.evalRef(target.e, target.scope) : target;
+        return target instanceof DExpr ? this.deref(target) : target;
       }
       case 'field':
         return this.field(this.evalRef(e.target, s), e.name, e.pos);
@@ -222,6 +242,7 @@ export class Evaluator {
         const v = this.eval(e.e, s);
         if (e.op === '+') return v;
         if (typeof v === 'number') return -v;
+        if (v instanceof CumulExpr) return this.negCumul(v, e.pos);
         if (isLinear(v) || v instanceof CPConstraint) return linMul(this.linear(v, e.pos), -1, e.pos);
         fail(`cannot negate a ${typeName(v)}`, e.pos);
       }
@@ -353,7 +374,7 @@ export class Evaluator {
       keys.push(set instanceof EnumType ? i : typeof k === 'number' ? k : fail('only arrays indexed by integers or enums can be indexed by a variable', pos));
       let item = target.items[i];
       if (item instanceof OplArray || item instanceof VarIndexed) return new VarIndexed(target, key);
-      if (item instanceof DExpr) item = this.evalRef(item.e, item.scope);
+      if (item instanceof DExpr) item = this.deref(item);
       items.push(this.linear(item, pos));
     }
     return this.flat(pos).element(keys, items, key, 'element');
@@ -585,7 +606,7 @@ export class Evaluator {
         this.forEach(q, s, (sc) => {
           const v = this.eval(body, sc);
           if (typeof v === 'number') constant += v;
-          else if (v instanceof CumulExpr) cumul = new CumulExpr([...((cumul as CumulExpr | null)?.pulses ?? []), ...v.pulses]);
+          else if (v instanceof CumulExpr) cumul = new CumulExpr([...((cumul as CumulExpr | null)?.terms ?? []), ...v.terms]);
           else (acc ??= new LinExpr()).addScaled(this.linear(v, body.pos), 1);
         });
         if (cumul) return cumul;
@@ -689,10 +710,35 @@ export class Evaluator {
       case 'exp':
         arity(1);
         return Math.exp(numArg(0));
-      case 'log':
       case 'ln':
         arity(1);
         return Math.log(numArg(0));
+      case 'log':
+        // OPL: log is base 10, lg base 2, ln natural.
+        arity(1);
+        return Math.log10(numArg(0));
+      case 'lg':
+        arity(1);
+        return Math.log2(numArg(0));
+      case 'distToInt':
+        arity(1);
+        return Math.abs(numArg(0) - Math.round(numArg(0)));
+      case 'intValue':
+      case 'floatValue': {
+        arity(1);
+        const v = Number(String(args[0]).trim());
+        if (Number.isNaN(v) || (fn === 'intValue' && !Number.isInteger(v))) fail(`${fn}: cannot convert "${args[0]}"`, pos);
+        return v;
+      }
+      case 'matchAt': {
+        arity(2);
+        if (typeof args[0] !== 'string' || typeof args[1] !== 'string') fail('matchAt(string, substring)', pos);
+        return args[0].indexOf(args[1]);
+      }
+      case 'srand':
+        arity(1);
+        seedRandom(numArg(0));
+        return numArg(0);
       case 'pow':
         arity(2);
         return Math.pow(numArg(0), numArg(1));
@@ -788,8 +834,64 @@ export class Evaluator {
       }
       case 'sqrt':
       case 'exp':
-      case 'log':
         return nonConst ? this.flat(pos).fn(fn, lin(args[0])) : undefined;
+      case 'ln':
+      case 'log':
+      case 'lg':
+        // natural log, scaled for base 10 / base 2
+        if (!nonConst) return undefined;
+        return linMul(this.flat(pos).fn('log', lin(args[0])), fn === 'ln' ? 1 : 1 / Math.log(fn === 'log' ? 10 : 2), pos);
+      case 'standardDeviation': {
+        // Population standard deviation (the n formula).
+        const xs = this.leaves(args[0]);
+        if (!xs.length) fail('standardDeviation of an empty array', pos);
+        if (xs.every((x) => typeof x === 'number')) {
+          const v = xs as number[];
+          const mean = v.reduce((a, b) => a + b, 0) / v.length;
+          return Math.sqrt(v.reduce((a, b) => a + (b - mean) ** 2, 0) / v.length);
+        }
+        const flat = this.flat(pos);
+        const ls = xs.map((x) => this.linear(x, pos));
+        const mean = ls.reduce<Linear>((a, b) => linAdd(a, b, 1), 0);
+        let sq: Linear = 0;
+        for (const x of ls) {
+          const d = linAdd(linMul(x, ls.length, pos), mean, -1);
+          sq = linAdd(sq, flat.mul(d, d), 1);
+        }
+        // sum (n x_i - sum x)^2 = n^2 sum (x_i - mean)^2 = n^3 variance
+        return linMul(flat.fn('sqrt', sq), 1 / (ls.length * Math.sqrt(ls.length)), pos);
+      }
+      case 'strictLex':
+      case 'lex':
+      case 'lexicographic': {
+        // x <lex y (strictLex) or x <=lex y: the first difference is smaller in x.
+        const strict = fn === 'strictLex';
+        const xv = this.leaves(args[0]);
+        const yv = this.leaves(args[1]);
+        if (xv.length !== yv.length) fail(`${fn} needs two arrays of the same size`, pos);
+        if (![...xv, ...yv].some((v) => isLinear(v) || v instanceof CPConstraint)) {
+          for (let i = 0; i < xv.length; i++) {
+            const [a, b] = [Number(xv[i]), Number(yv[i])];
+            if (a !== b) return a < b ? 1 : 0;
+          }
+          return strict ? 0 : 1;
+        }
+        const xs = xv.map((x) => this.linear(x, pos));
+        const ys = yv.map((y) => this.linear(y, pos));
+        let prefix: CPCons = { k: 'const', value: true };
+        let c: CPCons = { k: 'const', value: true };
+        for (let i = 0; i < xs.length; i++) {
+          c = { k: 'and', a: c, b: { k: 'imp', a: prefix, b: { k: 'cmp', op: '<=', l: xs[i], r: ys[i] } } };
+          prefix = { k: 'and', a: prefix, b: { k: 'cmp', op: '=', l: xs[i], r: ys[i] } };
+        }
+        // Strict: not all equal.
+        if (strict) c = { k: 'and', a: c, b: { k: 'not', a: prefix } };
+        return new CPConstraint(c);
+      }
+      case 'strong':
+      case 'inferred':
+        // Hints to CP Optimizer (stronger inference, inferred variables): no restriction.
+        return new CPConstraint({ k: 'const', value: true });
       case 'pow': {
         if (!nonConst) return undefined;
         const [b, k] = args;
@@ -843,8 +945,9 @@ export class Evaluator {
       }
       case 'rand': {
         const n = args[0];
+        if (n === undefined) return Math.floor(random() * 2147483647);
         if (typeof n !== 'number') fail('rand(n) needs a number', pos);
-        return Math.floor(Math.random() * n);
+        return Math.floor(random() * n);
       }
       case 'count': {
         if (args.length !== 2) fail('count(array, value) expects 2 arguments', pos);
@@ -903,19 +1006,6 @@ export class Evaluator {
         });
         return new CPConstraint({ k: 'table', xs, tuples: rows, positive: fn === 'allowedAssignments' });
       }
-      case 'lex':
-      case 'lexicographic': {
-        // x <=lex y: for each i, x[0..i-1] = y[0..i-1] implies x[i] <= y[i]
-        const xs = this.atoms([args[0]], pos);
-        const ys = this.atoms([args[1]], pos);
-        let prefix: CPCons = { k: 'const', value: true };
-        let c: CPCons = { k: 'const', value: true };
-        for (let i = 0; i < Math.min(xs.length, ys.length); i++) {
-          c = { k: 'and', a: c, b: { k: 'imp', a: prefix, b: { k: 'cmp', op: '<=', l: xs[i], r: ys[i] } } };
-          prefix = { k: 'and', a: prefix, b: { k: 'cmp', op: '=', l: xs[i], r: ys[i] } };
-        }
-        return new CPConstraint(c);
-      }
       case 'staticLex': {
         // Lexicographic objective as one weighted objective (exact for bounded integer criteria).
         const crit = args.map(lin);
@@ -943,8 +1033,8 @@ export class Evaluator {
         return new CPConstraint({ k: 'count', mode: fn === 'distribute' ? 'exact' : fn, cards, values, base });
       }
       case 'pack': {
-        // pack(load, where, size): load[b] = sum of size[i] over the items with where[i] = b
-        const [loadArr, whereArr, sizeArr] = args;
+        // pack(load, where, size[, used]): load[b] = sum of size[i] over the items with where[i] = b
+        const [loadArr, whereArr, sizeArr, used] = args;
         if (!(loadArr instanceof OplArray)) fail('pack(load, where, size) needs an array of bin loads', pos);
         const where = this.atoms([whereArr], pos);
         const size = this.leaves(sizeArr);
@@ -957,6 +1047,12 @@ export class Evaluator {
             sum.addScaled(linMul(isIn, this.linear(size[i], pos), pos), 1);
           });
           c = { k: 'and', a: c, b: { k: 'cmp', op: '=', l: this.linear(loadArr.items[bin], pos), r: sum } };
+        }
+        if (used !== undefined) {
+          // used = the number of bins with a non-zero load
+          const nonzero = new LinExpr();
+          for (const l of loadArr.items) nonzero.addScaled(this.linear(new CPConstraint({ k: 'cmp', op: '!=', l: this.linear(l, pos), r: 0 }), pos), 1);
+          c = { k: 'and', a: c, b: { k: 'cmp', op: '=', l: this.linear(used, pos), r: nonzero } };
         }
         return new CPConstraint(c);
       }
@@ -1007,7 +1103,7 @@ export class Evaluator {
       case 'startAtEnd':
         return this.ifPresent(args, this.temporal('start', 'end', args, pos, '=', undefined, true), pos);
       case 'noOverlap': {
-        if (args[0] instanceof Sequence) return this.noOverlapSequence(args[0], args[1], pos);
+        if (args[0] instanceof Sequence) return this.noOverlapSequence(args[0], args[1], args[2], pos);
         const acts = this.leaves(args[0]).map((a) => this.activityArg(a, pos));
         const res = new Resource(`noOverlap#${++this.noOverlaps}`, 'unary', 1, 0);
         return this.usesAll(acts.map((act) => ({ act, height: 1 })), res, pos);
@@ -1076,10 +1172,102 @@ export class Evaluator {
         }
         return new CPConstraint({ k: 'const', value: true });
       }
-      case 'pulse': {
-        const act = this.activityArg(args[0], pos);
-        return new CumulExpr([{ act, height: args[1] === undefined ? 1 : this.linear(args[1], pos) }]);
+      case 'pulse':
+      case 'step':
+      case 'stepAtStart':
+      case 'stepAtEnd':
+        return this.cumulTerm(fn, args, pos);
+      case 'heightAtStart':
+      case 'heightAtEnd': {
+        // The contribution of a to f at its start (pulses, steps at start) or end (steps).
+        const a = this.activityArg(args[0], pos);
+        const f = args[1];
+        if (!(f instanceof CumulExpr)) fail(`${fn} needs an interval and a cumul function`, pos);
+        const atStart = fn === 'heightAtStart';
+        let sum: Linear = 0;
+        for (const t of f.terms) if (t.act === a && (atStart ? t.kind === 'pulse' || t.at === 'start' : t.kind === 'step')) sum = linAdd(sum, t.height, 1);
+        const dval = args[2] === undefined ? 0 : args[2];
+        if (this.phase === 'post') return a.presence && dvarValue(a.presence) === 0 ? dval : this.solvedValue(sum);
+        return this.presentOr(a, sum, this.linear(dval, pos), pos);
       }
+      case 'cumulFunctionValue':
+      case 'stateFunctionValue': {
+        const f = args[0];
+        const t = args[1];
+        if (typeof t !== 'number') fail(`${fn} needs a time`, pos);
+        if (this.phase !== 'post') fail(`${fn} is only available after solving`, pos);
+        if (fn === 'cumulFunctionValue') {
+          if (!(f instanceof CumulExpr)) fail('cumulFunctionValue needs a cumul function', pos);
+          return cumulValue(this.solvedCumul(f), t);
+        }
+        if (!(f instanceof StateFunction)) fail('stateFunctionValue needs a state function', pos);
+        // -1: no state
+        return this.solvedStates(f).find(([a, b]) => a <= t && t < b)?.[2] ?? -1;
+      }
+      case 'numberOfSegments':
+      case 'segmentStart':
+      case 'segmentEnd':
+      case 'segmentValue': {
+        if (this.phase !== 'post') fail(`${fn} is only available after solving`, pos);
+        const f = args[0];
+        const segs =
+          f instanceof CumulExpr
+            ? cumulSegments(this.solvedCumul(f), INTERVAL_MAX)
+            : f instanceof StateFunction
+              ? this.withGaps(this.solvedStates(f))
+              : fail(`${fn} needs a cumul function or a state function`, pos);
+        if (fn === 'numberOfSegments') return segs.length;
+        const i = args[1];
+        if (typeof i !== 'number' || !Number.isInteger(i) || i < 0 || i >= segs.length) fail(`${fn}: there is no segment ${String(i)} (segments 0..${segs.length - 1})`, pos);
+        const [a, b, v] = segs[i];
+        return fn === 'segmentStart' ? a : fn === 'segmentEnd' ? b : v;
+      }
+      case 'startEval':
+      case 'endEval':
+      case 'sizeEval':
+      case 'lengthEval': {
+        const a = this.activityArg(args[0], pos);
+        const F = args[1];
+        const fun =
+          F instanceof PwlFunction
+            ? { at: (x: number) => F.at(x), points: F.bps, isInt: false }
+            : F instanceof StepFunction
+              ? { at: (x: number) => F.valueAt(x), points: F.points, isInt: F.values.every(Number.isInteger) }
+              : fail(`${fn} needs an interval and a piecewise-linear or step function`, pos);
+        const x: Linear = fn === 'startEval' ? a.start : fn === 'endEval' ? a.end : fn === 'lengthEval' ? linAdd(a.end, a.start, -1) : a.duration;
+        const dval = args[2] === undefined ? 0 : args[2];
+        if (this.phase === 'post') return a.presence && dvarValue(a.presence) === 0 ? dval : fun.at(this.solvedValue(x));
+        const z = typeof x === 'number' ? fun.at(x) : this.flat(pos).func(fun.at, fun.points, x, fun.isInt, `${fn}(${a.name})`);
+        return this.presentOr(a, z, this.linear(dval, pos), pos);
+      }
+      case 'overlapLength': {
+        // max(0, min(ends) - max(starts)) when present, absVal otherwise
+        const a = this.activityArg(args[0], pos);
+        const b = typeof args[1] === 'number' ? null : this.activityArg(args[1], pos);
+        const fixedArg = (i: number) => (typeof args[i] === 'number' ? (args[i] as number) : fail('overlapLength(a, start, end[, absVal]) needs a fixed start and end', pos));
+        const [s2, e2]: Linear[] = b ? [b.start, b.end] : [fixedArg(1), fixedArg(2)];
+        const absVal = (b ? args[2] : args[3]) ?? 0;
+        if (this.phase === 'post') {
+          if ((a.presence && dvarValue(a.presence) === 0) || (b?.presence && dvarValue(b.presence) === 0)) return absVal;
+          return Math.max(0, Math.min(a.end.value, this.solvedValue(e2)) - Math.max(a.start.value, this.solvedValue(s2)));
+        }
+        const flat = this.flat(pos);
+        const len = linAdd(flat.minmax([a.end, e2], true), flat.minmax([a.start, s2], false), -1);
+        const d = this.linear(absVal, pos);
+        let v: Linear = flat.minmax([0, len], false);
+        v = this.presentOr(a, v, d, pos);
+        return b ? this.presentOr(b, v, d, pos) : v;
+      }
+      case 'isomorphism':
+        return this.isomorphism(args, pos);
+      case 'sameSequence':
+      case 'sameCommonSubsequence':
+        return this.sameSequence(fn === 'sameSequence', args, pos);
+      case 'alwaysEqual':
+      case 'alwaysConstant':
+      case 'alwaysNoState':
+      case 'alwaysIn':
+        return this.alwaysCons(fn, args, pos);
       case 'startsAfterEnd':
         return this.temporal('start', 'end', args, pos, '>=');
       case 'startsAfterStart':
@@ -1257,12 +1445,31 @@ export class Evaluator {
     return new CPConstraint(c);
   }
 
-  /** noOverlap(sequence[, transition distances]): no two present intervals overlap, with setup times between types. */
-  private noOverlapSequence(seq: Sequence, matrix: Value | undefined, pos: SourcePos): CPConstraint {
+  /**
+   * noOverlap(sequence[, transition distances[, isDirect]]): no two present
+   * intervals overlap, and they run in the sequence's order.  A transition
+   * distance M[type(a)][type(b)] separates a from every later b (from the next
+   * one only when isDirect).
+   */
+  private noOverlapSequence(seq: Sequence, matrix: Value | undefined, direct: Value | undefined, pos: SourcePos): CPConstraint {
     const res = new Resource(`noOverlap#${++this.noOverlaps}`, 'unary', 1, 0);
-    let c = this.usesAll(seq.acts.map((act) => ({ act, height: 1 })), res, pos).c;
-    if (matrix === undefined) return new CPConstraint(c);
-    const dist = this.transitionDistance(matrix, pos);
+    const c = this.usesAll(seq.acts.map((act) => ({ act, height: 1 })), res, pos).c;
+    const dist = matrix === undefined ? () => 0 : this.transitionDistance(matrix, pos);
+    const isDirect = direct !== undefined && this.truthyValue(direct);
+    const state = this.sequenceState(seq);
+    state.overlaps.push({ dist, isDirect });
+    // Without order functions or direct transitions the order is the time order:
+    // pairwise disjunctions with the distances, no rank variables.
+    if (!isDirect && !state.ranks) return new CPConstraint({ k: 'and', a: c, b: this.timeDisjunctions(seq, dist) });
+    // Creating the ranks links every registered noOverlap, this one included.
+    if (state.ranks) this.linkOrder(seq, { dist, isDirect }, pos);
+    else this.ranks(seq, pos);
+    return new CPConstraint(c);
+  }
+
+  /** Present a, b: a + d(a, b) before b, or b + d(b, a) before a. */
+  private timeDisjunctions(seq: Sequence, dist: (a: number, b: number) => number): CPCons {
+    let c: CPCons = { k: 'const', value: true };
     const acts = seq.acts;
     for (let i = 0; i < acts.length; i++) {
       for (let j = i + 1; j < acts.length; j++) {
@@ -1278,27 +1485,41 @@ export class Evaluator {
         c = { k: 'and', a: c, b: { k: 'imp', a: this.presentCons([a, b]), b: order } };
       }
     }
-    return new CPConstraint(c);
+    return c;
+  }
+
+  private truthyValue(v: Value): boolean {
+    return typeof v === 'number' ? v !== 0 : typeof v === 'string' ? v !== '' : !!v;
   }
 
   /** A transition distance matrix: int M[T][T] or a set of <from, to, distance> tuples. */
   private transitionDistance(m: Value, pos: SourcePos): (a: number, b: number) => number {
+    return this.transitionTable(m, pos).dist;
+  }
+
+  /** A transition matrix (a 2-D array, or <from, to, distance> tuples: missing pairs 0, the largest of duplicates). */
+  transitionTable(m: Value, pos: SourcePos): { dist: (a: number, b: number) => number; states: number[] } {
     if (m instanceof OplArray) {
-      return (a, b) => {
+      const states = m.index instanceof OplRange ? m.items.map((_, i) => (m.index as OplRange).lo + i) : [];
+      const dist = (a: number, b: number) => {
         const row = m.items[m.index.indexOf(a)];
         if (!(row instanceof OplArray)) fail(`no transition distances for type ${a}`, pos);
         const v = row.items[row.index.indexOf(b)];
         return typeof v === 'number' ? v : fail(`no transition distance from type ${a} to ${b}`, pos);
       };
+      return { dist, states };
     }
     const elems = elementsOf(m);
     if (!elems) fail('a transition distance needs a matrix or a set of <from, to, distance> tuples', pos);
     const table = new Map<string, number>();
+    const states = new Set<number>();
     for (const t of elems) {
       if (!(t instanceof OplTuple) || t.values.length < 3) fail('transition tuples are <from, to, distance>', pos);
-      table.set(`${t.values[0]},${t.values[1]}`, Number(t.values[2]));
+      const key = `${t.values[0]},${t.values[1]}`;
+      table.set(key, Math.max(table.get(key) ?? -Infinity, Number(t.values[2])));
+      for (const v of t.values.slice(0, 2)) if (typeof v === 'number') states.add(v);
     }
-    return (a, b) => table.get(`${a},${b}`) ?? 0;
+    return { dist: (a, b) => table.get(`${a},${b}`) ?? 0, states: [...states] };
   }
 
   private seqIndex(seq: Sequence, v: Value, pos: SourcePos): number {
@@ -1308,9 +1529,89 @@ export class Evaluator {
     return i;
   }
 
-  /** first / last / before / prev on a sequence (whose intervals do not overlap). */
-  private sequenceOrder(fn: string, seq: Sequence, args: Value[], pos: SourcePos): Value {
+  private readonly sequenceStates = new WeakMap<Sequence, SequenceState>();
+  /** Rank variables of every sequence modelled so far (the search labels them first). */
+  private readonly rankSets: DVar[][] = [];
+
+  /** The sequence ranks among the given problem variables. */
+  rankVarsOf(vars: DVar[]): DVar[] {
+    return this.rankSets.filter((rs) => rs.every((v) => vars[v.id] === v)).flat();
+  }
+
+  private sequenceState(seq: Sequence): SequenceState {
+    let st = this.sequenceStates.get(seq);
+    if (!st) this.sequenceStates.set(seq, (st = { ranks: null, overlaps: [] }));
+    return st;
+  }
+
+  /**
+   * The permutation of a sequence: rank[i] in 0..n-1, all different; the
+   * present intervals take the ranks 0..count-1 (absent ones the others, in
+   * index order), next[i][j] = j directly follows i, first / last flags.
+   */
+  private ranks(seq: Sequence, pos: SourcePos): RankModel {
+    const st = this.sequenceState(seq);
+    if (st.ranks) return st.ranks;
+    const flat = this.flat(pos);
     const acts = seq.acts;
+    const n = acts.length;
+    const post = (c: CPCons) => flat.h.define({ k: 'post', cons: c });
+    const rank = acts.map((a) => flat.h.newVar(0, Math.max(0, n - 1), true, `rank(${seq.name},${a.name})`));
+    const count = new LinExpr();
+    for (const a of acts) count.addScaled(this.presenceLin(a), 1);
+    if (n > 1) post({ k: 'alldiff', xs: rank, level: 'default' });
+    const present = (a: Activity): CPCons => (a.presence ? { k: 'cmp', op: '=', l: a.presence, r: 1 } : { k: 'const', value: true });
+    acts.forEach((a, i) => {
+      const inside: CPCons = { k: 'cmp', op: '<=', l: rank[i], r: linAdd(count, -1, 1) };
+      if (!a.presence) return post(inside);
+      post({ k: 'equiv', a: present(a), b: inside });
+      // Absent intervals keep their index order (no symmetric permutations).
+      acts.forEach((b, j) => {
+        if (j <= i || !b.presence) return;
+        post({ k: 'imp', a: { k: 'and', a: { k: 'cmp', op: '=', l: a.presence!, r: 0 }, b: { k: 'cmp', op: '=', l: b.presence, r: 0 } }, b: { k: 'cmp', op: '<', l: rank[i], r: rank[j] } });
+      });
+    });
+    const next = acts.map((a, i) =>
+      acts.map((b, j) => {
+        const v = flat.h.newVar(0, i === j ? 0 : 1, true, `next(${a.name},${b.name})`);
+        if (i !== j) {
+          const follows: CPCons = { k: 'and', a: { k: 'and', a: present(a), b: present(b) }, b: { k: 'cmp', op: '=', l: rank[j], r: linAdd(rank[i], 1, 1) } };
+          post({ k: 'equiv', a: { k: 'cmp', op: '=', l: v, r: 1 }, b: follows });
+        }
+        return v;
+      }),
+    );
+    const last = acts.map((a, i) => linAdd(this.presenceLin(a), next[i].reduce((e, v) => e.addScaled(v, 1), new LinExpr()), -1));
+    const first = acts.map((a, i) => linAdd(this.presenceLin(a), acts.reduce((e, _, j) => e.addScaled(next[j][i], 1), new LinExpr()), -1));
+    st.ranks = { rank, next, first, last, count };
+    this.rankSets.push(rank);
+    // noOverlap constraints posted before the ranks existed now follow them too.
+    for (const o of st.overlaps) this.linkOrder(seq, o, pos);
+    return st.ranks;
+  }
+
+  /** noOverlap ties the sequence order to time: a ranked before b ends (plus its distance) before b starts. */
+  private linkOrder(seq: Sequence, o: { dist: (a: number, b: number) => number; isDirect: boolean }, pos: SourcePos): void {
+    const { rank, next } = this.ranks(seq, pos);
+    const flat = this.flat(pos);
+    const acts = seq.acts;
+    acts.forEach((a, i) => {
+      acts.forEach((b, j) => {
+        if (i === j) return;
+        const d = o.dist(seq.types[i], seq.types[j]);
+        const before: CPCons = { k: 'and', a: this.presentCons([a, b]), b: { k: 'cmp', op: '<', l: rank[i], r: rank[j] } };
+        flat.h.define({ k: 'post', cons: { k: 'imp', a: before, b: { k: 'cmp', op: '<=', l: a.end, r: b.start } } });
+        if (d && o.isDirect) {
+          flat.h.define({ k: 'post', cons: { k: 'imp', a: { k: 'cmp', op: '=', l: next[i][j], r: 1 }, b: { k: 'cmp', op: '<=', l: linAdd(a.end, d, 1), r: b.start } } });
+        } else if (d) {
+          flat.h.define({ k: 'post', cons: { k: 'imp', a: before, b: { k: 'cmp', op: '<=', l: linAdd(a.end, d, 1), r: b.start } } });
+        }
+      });
+    });
+  }
+
+  /** first / last / before / prev: constraints on the sequence's permutation. */
+  private sequenceOrder(fn: string, seq: Sequence, args: Value[], pos: SourcePos): Value {
     if (this.phase === 'post') {
       const order = this.solvedOrder(seq);
       const at = (v: Value) => order.indexOf(this.activityArg(v, pos));
@@ -1321,76 +1622,23 @@ export class Evaluator {
       return fn === 'before' ? (x < y ? 1 : 0) : y === x + 1 ? 1 : 0;
     }
     const i = this.seqIndex(seq, args[0], pos);
-    const a = acts[i];
-    if (fn === 'first' || fn === 'last') {
-      let c: CPCons = { k: 'const', value: true };
-      for (const b of acts) {
-        if (b === a) continue;
-        const o: CPCons = fn === 'first' ? { k: 'cmp', op: '<=', l: a.end, r: b.start } : { k: 'cmp', op: '<=', l: b.end, r: a.start };
-        c = { k: 'and', a: c, b: b.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: b.presence, r: 1 }, b: o } : o };
-      }
-      return new CPConstraint({ k: 'imp', a: this.presentCons([a]), b: c });
-    }
+    const a = seq.acts[i];
+    const { rank, next, count } = this.ranks(seq, pos);
+    if (fn === 'first') return new CPConstraint({ k: 'imp', a: this.presentCons([a]), b: { k: 'cmp', op: '=', l: rank[i], r: 0 } });
+    if (fn === 'last') return new CPConstraint({ k: 'imp', a: this.presentCons([a]), b: { k: 'cmp', op: '=', l: rank[i], r: linAdd(count, -1, 1) } });
     const j = this.seqIndex(seq, args[1], pos);
-    const b = acts[j];
-    if (fn === 'before') return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '<=', l: a.end, r: b.start } });
-    const next = this.successors(seq, pos);
-    return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '=', l: next.n[i][j], r: 1 } });
+    const b = seq.acts[j];
+    if (fn === 'before') return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '<', l: rank[i], r: rank[j] } });
+    return new CPConstraint({ k: 'imp', a: this.presentCons([a, b]), b: { k: 'cmp', op: '=', l: next[i][j], r: 1 } });
   }
 
-  /** The present intervals of a solved sequence, in start order. */
+  /** The present intervals of a solved sequence, in sequence order (ranks, else start times). */
   private solvedOrder(seq: Sequence): Activity[] {
+    const st = this.sequenceStates.get(seq);
+    const rankOf = (a: Activity) => (st?.ranks ? Number(dvarValue(st.ranks.rank[seq.acts.indexOf(a)])) : 0);
     return seq.acts
       .filter((a) => !a.presence || dvarValue(a.presence) === 1)
-      .sort((x, y) => Number(dvarValue(x.start)) - Number(dvarValue(y.start)) || Number(dvarValue(x.end)) - Number(dvarValue(y.end)));
-  }
-
-  private readonly successorModels = new WeakMap<Sequence, { n: DVar[][]; last: Linear[]; first: Linear[] }>();
-
-  /**
-   * Successor booleans n[a][b] (b directly follows a) for a sequence whose
-   * intervals do not overlap, with last[a] / first[a] = present and no
-   * successor / predecessor.
-   */
-  private successors(seq: Sequence, pos: SourcePos): { n: DVar[][]; last: Linear[]; first: Linear[] } {
-    const cached = this.successorModels.get(seq);
-    if (cached) return cached;
-    const flat = this.flat(pos);
-    const acts = seq.acts;
-    const k = acts.length;
-    const n = acts.map((a, i) => acts.map((b, j) => flat.h.newVar(0, i === j ? 0 : 1, true, `next(${a.name},${b.name})`)));
-    const post = (c: CPCons) => flat.h.define({ k: 'post', cons: c });
-    const p = (a: Activity): CPCons => (a.presence ? { k: 'cmp', op: '=', l: a.presence, r: 1 } : { k: 'const', value: true });
-    for (let i = 0; i < k; i++) {
-      const out = new LinExpr();
-      const inn = new LinExpr();
-      for (let j = 0; j < k; j++) {
-        out.addScaled(n[i][j], 1);
-        inn.addScaled(n[j][i], 1);
-      }
-      post({ k: 'cmp', op: '<=', l: out, r: this.presenceLin(acts[i]) });
-      post({ k: 'cmp', op: '<=', l: inn, r: this.presenceLin(acts[i]) });
-      for (let j = 0; j < k; j++) {
-        if (i === j) continue;
-        const [a, b] = [acts[i], acts[j]];
-        // b next after a: both present, a before b, nothing in between.
-        let between: CPCons = { k: 'and', a: { k: 'and', a: p(a), b: p(b) }, b: { k: 'cmp', op: '<=', l: a.end, r: b.start } };
-        for (let m = 0; m < k; m++) {
-          if (m === i || m === j) continue;
-          const c = acts[m];
-          const outside: CPCons = { k: 'or', a: { k: 'cmp', op: '<=', l: c.end, r: a.start }, b: { k: 'cmp', op: '<=', l: b.end, r: c.start } };
-          between = { k: 'and', a: between, b: c.presence ? { k: 'imp', a: { k: 'cmp', op: '=', l: c.presence, r: 1 }, b: outside } : outside };
-        }
-        post({ k: 'imp', a: { k: 'cmp', op: '=', l: n[i][j], r: 1 }, b: between });
-        // Something after a: a has a successor.
-        post({ k: 'imp', a: { k: 'and', a: { k: 'and', a: p(a), b: p(b) }, b: { k: 'cmp', op: '<=', l: a.end, r: b.start } }, b: { k: 'cmp', op: '=', l: out, r: 1 } });
-      }
-    }
-    const last = acts.map((a, i) => linAdd(this.presenceLin(a), n[i].reduce((e, v) => e.addScaled(v, 1), new LinExpr()), -1));
-    const first = acts.map((a, i) => linAdd(this.presenceLin(a), acts.reduce((e, _, j) => e.addScaled(n[j][i], 1), new LinExpr()), -1));
-    const model = { n, last, first };
-    this.successorModels.set(seq, model);
-    return model;
+      .sort((x, y) => rankOf(x) - rankOf(y) || Number(dvarValue(x.start)) - Number(dvarValue(y.start)) || Number(dvarValue(x.end)) - Number(dvarValue(y.end)));
   }
 
   /** typeOfNext / startOfNext / ... / lengthOfPrev(sequence, a, lastValue, absentValue). */
@@ -1424,7 +1672,7 @@ export class Evaluator {
       return num(b.duration);
     }
     const flat = this.flat(pos);
-    const { n, last, first } = this.successors(seq, pos);
+    const { next: n, last, first } = this.ranks(seq, pos);
     let e: Linear = 0;
     seq.acts.forEach((_, j) => {
       if (j === i) return;
@@ -1449,13 +1697,242 @@ export class Evaluator {
     return new CPConstraint(c);
   }
 
-  /** f <= C for a cumul function, and sums of cumul functions. */
+  /** f <= h, f >= h for a cumul function, and sums and differences of cumul functions. */
   private cumulOp(op: string, l: Value, r: Value, pos: SourcePos): Value {
-    if (op === '+' && l instanceof CumulExpr && r instanceof CumulExpr) return new CumulExpr([...l.pulses, ...r.pulses]);
-    const [f, cap, flipped] = l instanceof CumulExpr ? [l, r, false] : [r as CumulExpr, l, true];
+    if (op === '+' || op === '-') {
+      if (!(l instanceof CumulExpr) || !(r instanceof CumulExpr)) fail('a cumul function can only be added to or subtracted from a cumul function', pos);
+      return new CumulExpr([...l.terms, ...(op === '-' ? this.negCumul(r, pos).terms : r.terms)]);
+    }
+    const [f, h, flipped] = l instanceof CumulExpr ? [l, r, false] : [r as CumulExpr, l, true];
     const le = flipped ? op === '>=' : op === '<=';
-    if (!le || typeof cap !== 'number') fail('a cumul function can only be bounded by a constant: f <= C', pos);
-    return this.usesAll(f.pulses, new Resource(`cumul#${f.pulses.length}`, 'discrete', cap, 0), pos);
+    const ge = flipped ? op === '<=' : op === '>=';
+    if ((!le && !ge) || typeof h !== 'number') fail('a cumul function can only be bounded by a constant: f <= h or f >= h', pos);
+    return this.cumulCons(f, le ? -Infinity : h, le ? h : Infinity, { k: 'all' });
+  }
+
+  private cumuls = 0;
+
+  /** lo <= f <= hi on the window (f >= 0 holds everywhere). */
+  private cumulCons(f: CumulExpr, lo: number, hi: number, window: FunctionWindow): CPConstraint {
+    if (this.phase === 'post') return new CPConstraint({ k: 'const', value: true });
+    // Non-negative interval pulses under a capacity: a discrete resource (with edge finding).
+    const plain = f.terms.every((t) => t.kind === 'pulse' && t.act && typeof t.height === 'number' && t.height >= 0);
+    if (window.k === 'all' && lo <= 0 && isFinite(hi) && plain) {
+      const res = new Resource(`cumul#${++this.cumuls}`, 'discrete', hi, 0);
+      let c: CPCons = { k: 'const', value: true };
+      for (const t of f.terms) c = { k: 'and', a: c, b: { k: 'uses', how: 'requires', act: t.act!, res, amount: t.height, presence: t.act!.presence } };
+      return new CPConstraint(c);
+    }
+    return new CPConstraint({ k: 'cumul', terms: f.terms, lo, hi, window });
+  }
+
+  /** pulse(a, h), pulse(a, hmin, hmax), pulse(u, v, h), step(u, h), stepAtStart / stepAtEnd(a, h | hmin, hmax). */
+  private cumulTerm(fn: string, args: Value[], pos: SourcePos): CumulExpr {
+    const n = (i: number): number => (typeof args[i] === 'number' ? (args[i] as number) : fail(`${fn}: argument ${i + 1} must be a number`, pos));
+    if (fn === 'step') return new CumulExpr([{ kind: 'step', act: null, at: 'start', from: n(0), to: Infinity, height: n(1) }]);
+    if (fn === 'pulse' && !(args[0] instanceof Activity)) {
+      if (n(1) < n(0)) fail('pulse(u, v, h) needs u <= v', pos);
+      return new CumulExpr([{ kind: 'pulse', act: null, at: 'start', from: n(0), to: n(1), height: n(2) }]);
+    }
+    const act = this.activityArg(args[0], pos);
+    let height: Linear;
+    if (args.length >= 3) {
+      // A height chosen in [hmin, hmax]
+      const [lo, hi] = [n(1), n(2)];
+      if (lo > hi) fail(`${fn}(a, hmin, hmax) needs hmin <= hmax`, pos);
+      height = lo === hi ? lo : this.flat(pos).h.newVar(lo, hi, true, `${fn}(${act.name}).height`);
+    } else {
+      const h = args[1] === undefined ? 1 : this.linear(args[1], pos);
+      height = typeof h === 'number' ? h : this.flat(pos).atom(h, `${fn}(${act.name}).height`);
+    }
+    if (height instanceof DVar) this.heightVars.set(height.id, height);
+    return new CumulExpr([{ kind: fn === 'pulse' ? 'pulse' : 'step', act, at: fn === 'stepAtEnd' ? 'end' : 'start', from: 0, to: 0, height }]);
+  }
+
+  /** Variables of cumul function heights, for their values after solving. */
+  private readonly heightVars = new Map<number, DVar>();
+
+  private negCumul(f: CumulExpr, pos: SourcePos): CumulExpr {
+    return new CumulExpr(f.terms.map((t) => ({ ...t, height: typeof t.height === 'number' ? -t.height : linMul(t.height, -1, pos) })));
+  }
+
+  /** The value of an expression over interval bounds and heights, after solving. */
+  private solvedValue(v: Linear): number {
+    if (typeof v === 'number') return v;
+    if (v instanceof DVar) return v.value;
+    let sum = v.constant;
+    for (const [id, c] of v.terms) {
+      const x = this.heightVars.get(id) ?? this.cp?.dvar(id);
+      if (!x) fail('internal: a variable without a solution value');
+      sum += c * x.value;
+    }
+    return sum;
+  }
+
+  /** v when a is present, d otherwise. */
+  private presentOr(a: Activity, v: Linear, d: Linear, pos: SourcePos): Linear {
+    if (!a.presence) return v;
+    const diff = linAdd(v, d, -1);
+    const scaled = typeof diff === 'number' ? linMul(a.presence, diff, pos) : this.flat(pos).mul(a.presence, diff);
+    return linAdd(scaled, d, 1);
+  }
+
+  private solvedCumul(f: CumulExpr): { step: boolean; start: number; end: number; height: number; present: boolean }[] {
+    return f.terms.map((t) => {
+      const height = this.solvedValue(t.height);
+      if (!t.act) return { step: t.kind === 'step', start: t.from, end: t.to, height, present: true };
+      const present = !t.act.presence || dvarValue(t.act.presence) === 1;
+      const start = t.kind === 'step' && t.at === 'end' ? t.act.end.value : t.act.start.value;
+      return { step: t.kind === 'step', start, end: t.act.end.value, height, present };
+    });
+  }
+
+  /** The state segments [start, end, state] of a solved state function. */
+  private solvedStates(f: StateFunction): [number, number, number][] {
+    const ws: StateFixed[] = [];
+    for (const w of f.windows) {
+      const win = w.window;
+      if (win.k === 'interval' && win.act.presence && dvarValue(win.act.presence) === 0) continue;
+      const [s, e] = win.k === 'all' ? [-INTERVAL_MAX, INTERVAL_MAX] : win.k === 'fixed' ? [win.from, win.to] : [win.act.start.value, win.act.end.value];
+      ws.push({ kind: w.kind, s, e, v: w.kind === 'equal' ? w.value : (w.state?.value ?? 0), lo: w.lo, hi: w.hi, aligns: w.aligns, aligne: w.aligne });
+    }
+    return stateSegments(ws, (a, b) => f.distance(a, b)) ?? [];
+  }
+
+  /** State segments with the stretches without state (-1) between them, from -IntervalMax to IntervalMax. */
+  private withGaps(segs: [number, number, number][]): [number, number, number][] {
+    const out: [number, number, number][] = [];
+    let t = -INTERVAL_MAX;
+    for (const [a, b, v] of segs) {
+      if (a > t) out.push([t, a, -1]);
+      out.push([a, b, v]);
+      t = b;
+    }
+    if (t < INTERVAL_MAX) out.push([t, INTERVAL_MAX, -1]);
+    return out;
+  }
+
+  /** alwaysEqual / alwaysConstant / alwaysNoState / alwaysIn on a state function, alwaysIn on a cumul function. */
+  private alwaysCons(fn: string, args: Value[], pos: SourcePos): CPConstraint {
+    const f = args[0];
+    const n = (i: number): number => (typeof args[i] === 'number' ? (args[i] as number) : fail(`${fn}: argument ${i + 1} must be a number`, pos));
+    const byAct = args[1] instanceof Activity;
+    const window: FunctionWindow = byAct ? { k: 'interval', act: args[1] as Activity } : { k: 'fixed', from: n(1), to: n(2) };
+    const at = byAct ? 2 : 3;
+    if (!byAct && n(2) < n(1)) fail(`${fn}: the window needs start <= end`, pos);
+    if (fn === 'alwaysIn' && f instanceof CumulExpr) {
+      if (n(at) > n(at + 1)) fail('alwaysIn needs hmin <= hmax', pos);
+      return this.cumulCons(f, n(at), n(at + 1), window);
+    }
+    if (!(f instanceof StateFunction)) fail(`${fn} needs a state function${fn === 'alwaysIn' ? ' or a cumul function' : ''}`, pos);
+    const flag = (i: number) => args[i] !== undefined && this.truthyValue(args[i]);
+    const w: StateWindow = { kind: 'none', window, value: 0, lo: 0, hi: 0, aligns: false, aligne: false };
+    if (fn === 'alwaysEqual') {
+      const v = n(at);
+      if (!Number.isInteger(v) || v < 0) fail('alwaysEqual needs a non-negative integer state', pos);
+      Object.assign(w, { kind: 'equal', value: v, aligns: flag(at + 1), aligne: flag(at + 2) });
+    } else if (fn === 'alwaysConstant') Object.assign(w, { kind: 'constant', aligns: flag(at), aligne: flag(at + 1) });
+    else if (fn === 'alwaysIn') {
+      if (n(at) > n(at + 1)) fail('alwaysIn needs vmin <= vmax', pos);
+      Object.assign(w, { kind: 'in', lo: n(at), hi: n(at + 1) });
+    }
+    // The pairwise constraints and the check are made with the model (finishScheduling).
+    if (this.phase === 'model') f.windows.push(w);
+    return new CPConstraint({ k: 'const', value: true });
+  }
+
+  /** Indexes of a one-dimensional array (0-based for arrays built with all). */
+  private arrayKeys(v: Value, n: number): number[] {
+    if (v instanceof OplArray && v.items.length === n) {
+      const set = v.index;
+      if (set instanceof OplRange) return v.items.map((_, i) => set.lo + i);
+      if (set instanceof OplSet && set.elems.every((k) => typeof k === 'number')) return set.elems as number[];
+    }
+    return [...Array(n).keys()];
+  }
+
+  /**
+   * isomorphism(A, B[, M, v]): the present intervals of A and B match one to
+   * one with the same start and end; M[i] is the index in A matched with B[i]
+   * (v when B[i] is absent).
+   */
+  private isomorphism(args: Value[], pos: SourcePos): CPConstraint {
+    const A = this.leaves(args[0]).map((a) => this.activityArg(a, pos));
+    const B = this.leaves(args[1]).map((b) => this.activityArg(b, pos));
+    const M = args[2] === undefined ? null : this.leaves(args[2]).map((m) => this.linear(m, pos));
+    if (M && M.length !== B.length) fail('isomorphism: the map array needs one entry per interval of B', pos);
+    if (this.phase === 'post') return new CPConstraint({ k: 'const', value: true });
+    const absent = args[3] === undefined ? 0 : this.linear(args[3], pos);
+    const keys = this.arrayKeys(args[0], A.length);
+    const flat = this.flat(pos);
+    const x = B.map((b) => A.map((a) => flat.h.newVar(0, 1, true, `isomorphism(${a.name},${b.name})`)));
+    let c: CPCons = { k: 'const', value: true };
+    const and = (d: CPCons) => (c = { k: 'and', a: c, b: d });
+    B.forEach((b, i) => {
+      const row = new LinExpr();
+      for (const v of x[i]) row.addScaled(v, 1);
+      and({ k: 'cmp', op: '=', l: row, r: this.presenceLin(b) });
+      if (M) {
+        const m = new LinExpr();
+        x[i].forEach((v, j) => m.addScaled(v, keys[j]));
+        const off = linAdd(1, this.presenceLin(b), -1);
+        m.addScaled(typeof absent === 'number' || typeof off === 'number' ? linMul(off, absent, pos) : flat.mul(off, absent), 1);
+        and({ k: 'cmp', op: '=', l: M[i], r: m });
+      }
+      A.forEach((a, j) => {
+        const same: CPCons = { k: 'and', a: { k: 'cmp', op: '=', l: a.start, r: b.start }, b: { k: 'cmp', op: '=', l: a.end, r: b.end } };
+        and({ k: 'imp', a: { k: 'cmp', op: '=', l: x[i][j], r: 1 }, b: same });
+      });
+    });
+    A.forEach((a, j) => {
+      const col = new LinExpr();
+      for (const row of x) col.addScaled(row[j], 1);
+      and({ k: 'cmp', op: '=', l: col, r: this.presenceLin(a) });
+    });
+    return new CPConstraint(c);
+  }
+
+  /**
+   * sameSequence(s1, s2[, A1, A2]): A1[k] and A2[k] (by default the k-th
+   * intervals of the sequences) have the same presence, and the present ones
+   * come in the same order.  sameCommonSubsequence: only the pairs present in
+   * both keep their order.
+   */
+  private sameSequence(same: boolean, args: Value[], pos: SourcePos): CPConstraint {
+    const [s1, s2] = args;
+    const name = same ? 'sameSequence' : 'sameCommonSubsequence';
+    if (!(s1 instanceof Sequence) || !(s2 instanceof Sequence)) fail(`${name} needs two sequences`, pos);
+    const A1 = args.length >= 4 ? this.leaves(args[2]).map((a) => this.activityArg(a, pos)) : s1.acts;
+    const A2 = args.length >= 4 ? this.leaves(args[3]).map((a) => this.activityArg(a, pos)) : s2.acts;
+    if (A1.length !== A2.length) fail(`${name} needs as many intervals in both sequences`, pos);
+    const at = (seq: Sequence, a: Activity) => {
+      const k = seq.acts.indexOf(a);
+      if (k < 0) fail(`${a.name} is not an interval of the sequence ${seq.name}`, pos);
+      return k;
+    };
+    const k1 = A1.map((a) => at(s1, a));
+    const k2 = A2.map((a) => at(s2, a));
+    if (this.phase === 'post') return new CPConstraint({ k: 'const', value: true });
+    const r1 = this.ranks(s1, pos).rank;
+    const r2 = this.ranks(s2, pos).rank;
+    let c: CPCons = { k: 'const', value: true };
+    if (same) {
+      A1.forEach((a, k) => {
+        if (a.presence || A2[k].presence) c = { k: 'and', a: c, b: { k: 'cmp', op: '=', l: this.presenceLin(a), r: this.presenceLin(A2[k]) } };
+      });
+    }
+    for (let i = 0; i < A1.length; i++) {
+      for (let j = i + 1; j < A1.length; j++) {
+        const cond = this.presentCons(same ? [A1[i], A1[j]] : [A1[i], A1[j], A2[i], A2[j]]);
+        const order: CPCons = {
+          k: 'equiv',
+          a: { k: 'cmp', op: '<', l: r1[k1[i]], r: r1[k1[j]] },
+          b: { k: 'cmp', op: '<', l: r2[k2[i]], r: r2[k2[j]] },
+        };
+        c = { k: 'and', a: c, b: cond.k === 'const' ? order : { k: 'imp', a: cond, b: order } };
+      }
+    }
+    return new CPConstraint(c);
   }
 
   private uses(how: 'requires' | 'consumes' | 'produces', args: Value[], pos: SourcePos): CPConstraint {
@@ -1641,6 +2118,14 @@ export class Evaluator {
           case 'sqrt':
           case 'exp':
           case 'log':
+          case 'lg':
+          case 'distToInt':
+          case 'standardDeviation':
+          case 'startEval':
+          case 'endEval':
+          case 'sizeEval':
+          case 'lengthEval':
+          case 'floatValue':
           case 'ln':
           case 'frac':
           case 'pow':
@@ -2001,4 +2486,32 @@ function setOp(op: string, l: Value, r: Value, pos: SourcePos): OplSet {
     default:
       return new OplSet([...a.filter((x) => !inB.has(keyOf(x))), ...b.filter((x) => !inA.has(keyOf(x)))], et);
   }
+}
+
+/** The permutation model of a sequence variable (see Evaluator.ranks). */
+interface RankModel {
+  rank: DVar[];
+  next: DVar[][];
+  first: Linear[];
+  last: Linear[];
+  count: LinExpr;
+}
+
+interface SequenceState {
+  ranks: RankModel | null;
+  /** noOverlap constraints on the sequence, linked to the ranks once they exist. */
+  overlaps: { dist: (a: number, b: number) => number; isDirect: boolean }[];
+}
+
+/** OPL's rand / srand: a seeded generator (mulberry32), shared with scripts. */
+let randomState = 0x9e3779b9;
+export function seedRandom(seed: number): void {
+  randomState = (seed >>> 0) ^ 0x9e3779b9;
+}
+export function random(): number {
+  randomState = (randomState + 0x6d2b79f5) | 0;
+  let t = randomState;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }

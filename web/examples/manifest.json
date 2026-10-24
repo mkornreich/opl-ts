@@ -178,6 +178,28 @@
       "data": []
     },
     {
+      "id": "tank",
+      "title": "Storage tank",
+      "category": "Scheduling",
+      "summary": "A cumul function with steps: batches fill a tank when they end, deliveries empty it when they start; it holds 20 m³ and never runs dry.",
+      "files": [
+        "web/examples/tank.mod"
+      ],
+      "main": "tank.mod",
+      "data": []
+    },
+    {
+      "id": "furnace",
+      "title": "Furnace batches",
+      "category": "Scheduling",
+      "summary": "A state function: parts at one temperature share the furnace as aligned batches, and heating up or cooling down takes time.",
+      "files": [
+        "web/examples/furnace.mod"
+      ],
+      "main": "furnace.mod",
+      "data": []
+    },
+    {
       "id": "house",
       "title": "House building",
       "category": "Scheduling",
@@ -221,14 +243,14 @@
       "other": 6
     },
     "highsAgree": 47,
-    "mipFuzz": 2400,
+    "mipFuzz": 6000,
     "qpFuzz": {
       "total": 1085,
       "agree": 1006,
       "highsWrong": 79
     },
-    "bruteForce": 1000,
-    "tests": 73,
+    "bruteForce": 1900,
+    "tests": 81,
     "tutorial": 12,
     "globalFuzz": 1200
   }

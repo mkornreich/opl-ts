@@ -16,7 +16,7 @@ import * as vm from 'node:vm';
 import type { DataAst, ModelAst } from './ast.js';
 import { Activity } from './cp/terms.js';
 import { fail, OplError, type SourcePos } from './errors.js';
-import { DExpr, dvarValue } from './eval.js';
+import { DExpr, dvarValue, random, seedRandom } from './eval.js';
 import { resolveOutput } from './files.js';
 import { ConstraintRef, DVar } from './linear.js';
 import type { ModelInstance } from './model.js';
@@ -506,12 +506,29 @@ export class IlogRuntime {
       trunc: Math.trunc,
       sqrt: Math.sqrt,
       exp: Math.exp,
-      log: Math.log,
+      log: Math.log10,
+      ln: Math.log,
+      lg: Math.log2,
       pow: Math.pow,
+      frac: (x: number) => x - Math.trunc(x),
+      sgn: Math.sign,
+      distToInt: (x: number) => Math.abs(x - Math.round(x)),
+      intValue: (s: unknown) => Math.trunc(Number(s)),
+      floatValue: (s: unknown) => Number(s),
+      matchAt: (s: string, sub: string) => String(s).indexOf(String(sub)),
+      length: (s: string) => String(s).length,
       minl: (...a: number[]) => Math.min(...a.map(Number)),
       maxl: (...a: number[]) => Math.max(...a.map(Number)),
-      rand: (n: number) => Math.floor(Math.random() * n),
-      srand: () => {},
+      rand: (n?: number) => Math.floor(random() * (n === undefined ? 2147483647 : n)),
+      srand: (seed: number) => {
+        seedRandom(Number(seed));
+        return seed;
+      },
+      standardDeviation: (a: unknown) => {
+        const v = (Array.isArray(a) ? a : Object.values(a as object)).map(Number);
+        const mean = v.reduce((x, y) => x + y, 0) / v.length;
+        return Math.sqrt(v.reduce((x, y) => x + (y - mean) ** 2, 0) / v.length);
+      },
       card: (s: unknown) => set(s).size,
       ord: (s: unknown, e: unknown) => set(s).indexOf(rt.fromJS(e)),
       first: (s: unknown) => rt.toJS(set(s).at(0)),

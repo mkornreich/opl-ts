@@ -593,6 +593,19 @@ class Parser {
           this.acceptPunct(';');
           return [{ k: 'struct', name, fields, pos }];
         }
+        case 'stateFunction': {
+          this.next();
+          const out: Stmt[] = [];
+          do {
+            const fpos = this.pos;
+            const name = this.expectIdent().text;
+            const dims = this.parseDims();
+            const matrix = this.acceptIdent('with') ? this.parseExpr() : null;
+            out.push({ k: 'stateFunction', name, dims, matrix, pos: fpos });
+          } while (this.acceptPunct(','));
+          this.expectPunct(';');
+          return out;
+        }
         case 'var':
         case 'dvar': {
           this.next();

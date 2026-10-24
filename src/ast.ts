@@ -111,6 +111,8 @@ export type Stmt =
   | { k: 'activity'; name: string; dims: Dim[]; duration: Expr | null; breakable: boolean; transitionType?: Expr | null; pos: SourcePos }
   /** dvar sequence s[dims] in intervals [types t]; (CP Optimizer) */
   | { k: 'sequence'; name: string; dims: Dim[]; intervals: Expr; types: Expr | null; pos: SourcePos }
+  /** stateFunction f[dims] [with M]; (CP Optimizer) */
+  | { k: 'stateFunction'; name: string; dims: Dim[]; matrix: Expr | null; pos: SourcePos }
   | { k: 'resource'; kind: ResourceDeclKind; name: string; dims: Dim[]; args: Expr[]; pos: SourcePos };
 
 /** dvar interval a [optional] [in lo..hi] [size s] */

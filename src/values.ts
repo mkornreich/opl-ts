@@ -184,6 +184,7 @@ export type Value =
   | import('./eval.js').PwlFunction
   | import('./cp/terms.js').StepFunction
   | import('./cp/terms.js').Sequence
+  | import('./cp/terms.js').StateFunction
   | import('./eval.js').CumulExpr
   | HostObject;
 
